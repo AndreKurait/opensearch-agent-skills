@@ -3,7 +3,7 @@
     "opensearch-migrations::skills->skills/external/opensearch-migrations": {
       "branch": "main",
       "dest_path": "skills/external/opensearch-migrations",
-      "last_sha": "9814ff20fc7b55945322ef829ff14071ccc96369",
+      "last_sha": "a8b584adbf51a0343ff76e18286b9ab8105b90c5",
       "src_path": "skills",
       "url": "https://github.com/AndreKurait/opensearch-migrations.git"
     }
