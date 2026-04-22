@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pyyaml"]
+# dependencies = ["pyyaml", "skills-ref>=0.1.1"]
 # ///
 """
 Skill sync — import skill subdirectories from upstream repos into this one.
@@ -375,6 +375,76 @@ def import_commit(
     return run(["git", "rev-parse", "HEAD"], cwd=dest_repo).stdout.strip()
 
 
+# ---------- skill spec validation ----------
+#
+# After a source's commits have been imported, we run the Agent Skills Spec
+# validator (github.com/agentskills/agentskills, Apache-2.0) against every
+# SKILL.md under the source's dest_path. Any spec violation -- wrong YAML
+# shape, illegal top-level field, name mismatch, missing required field --
+# aborts the whole source import. The existing sync_one except block then
+# hard-resets to pre_head and the issue reporter files a failure issue,
+# so callers see the same visibility as any other sync failure.
+#
+# We validate the WHOLE dest tree, not just the individual files each
+# commit touched. A commit that didn't touch SKILL.md can still invalidate
+# an existing skill (e.g. renaming the directory without updating `name`),
+# and re-validating the whole tree on every successful import gives us a
+# cheap invariant: "if sync succeeded, every skill under dest_path is
+# spec-valid at HEAD." That's what downstream consumers actually care about.
+
+def validate_skill_tree(tree_root: Path) -> dict[Path, list[str]]:
+    """Validate every skill under `tree_root` against the Agent Skills Spec.
+
+    Returns a mapping of skill_dir -> list[error_msg] for skills that failed
+    validation. Empty dict means everything under this tree is spec-valid.
+
+    A "skill" is any directory that contains a SKILL.md file. The parent
+    of each SKILL.md is passed to skills_ref.validator.validate(), which
+    checks frontmatter fields, name<->directory match, YAML block style,
+    allowed fields, length limits, etc.
+    """
+    # Import lazily: keeps the top-of-file import block lean and means a
+    # missing skills-ref install (e.g. someone running an old checkout
+    # without `uv sync`) surfaces a clear error only if we actually try
+    # to validate, not at module load time.
+    from skills_ref.validator import validate as sr_validate
+
+    failures: dict[Path, list[str]] = {}
+    if not tree_root.exists():
+        # No skills imported yet (e.g. first run against an empty upstream).
+        # Nothing to validate -- that's not an error.
+        return failures
+    for skill_md in sorted(tree_root.rglob("SKILL.md")):
+        skill_dir = skill_md.parent
+        errors = sr_validate(skill_dir)
+        if errors:
+            failures[skill_dir] = errors
+    return failures
+
+
+def format_validation_failures(
+    tree_root: Path, failures: dict[Path, list[str]]
+) -> str:
+    """Render validation failures as a human-readable block for issue bodies."""
+    lines = [
+        f"Agent Skills Spec validation failed for {len(failures)} skill(s) "
+        f"under `{tree_root}`:",
+        "",
+    ]
+    for skill_dir, errors in sorted(failures.items()):
+        rel = skill_dir.relative_to(REPO_ROOT) if skill_dir.is_absolute() else skill_dir
+        lines.append(f"- `{rel}/SKILL.md`")
+        for err in errors:
+            lines.append(f"    - {err}")
+    lines += [
+        "",
+        "Fix the SKILL.md files in the upstream repo so they comply with the "
+        "spec at https://agentskills.io. Imports for this source are rolled "
+        "back; the next sync run after the upstream is fixed will retry.",
+    ]
+    return "\n".join(lines)
+
+
 def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> SourceResult:
     result = SourceResult(source=source, status="up-to-date")
     try:
@@ -433,6 +503,19 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
                 continue
             imported += 1
             log(f"  imported {sha[:12]} -> {new_sha[:12]}")
+
+        # Validate the post-import dest tree against the Agent Skills Spec.
+        # Any spec violation raises, which the outer `except` turns into a
+        # hard reset to pre_head + a failure result -> issue opened.
+        # We do this BEFORE bumping state.json so a failed validation also
+        # leaves last_sha unchanged, so the next run retries the same range
+        # rather than silently skipping past a broken commit.
+        dest_tree = dest_repo / source.dest_path
+        validation_failures = validate_skill_tree(dest_tree)
+        if validation_failures:
+            raise RuntimeError(
+                format_validation_failures(dest_tree, validation_failures)
+            )
 
         # Always update state.json, even if every imported commit ended up empty —
         # otherwise we'd rescan them next run.
