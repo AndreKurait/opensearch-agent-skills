@@ -70,9 +70,15 @@ CACHE_DIR = REPO_ROOT / ".sync-cache"
 STATE_FILE = REPO_ROOT / "sync" / "state.json"
 DEFAULT_SOURCES_DIR = REPO_ROOT / "sync" / "sources"
 
-SYNC_BOT_NAME = os.environ.get("SYNC_BOT_NAME", "opensearch-skills-sync[bot]")
+# Default identity: opensearch-ci-bot (GitHub user id 83309141, display name
+# "opensearch-ci"). The noreply `<id>+<login>@users.noreply.github.com` form
+# makes GitHub auto-resolve the commit author to that profile, so every sync
+# commit renders with the opensearch-ci-bot avatar + clickable profile link
+# on github.com — without needing to register a GitHub App or hold a PAT for
+# that account. Override via SYNC_BOT_NAME / SYNC_BOT_EMAIL env for local runs.
+SYNC_BOT_NAME = os.environ.get("SYNC_BOT_NAME", "opensearch-ci")
 SYNC_BOT_EMAIL = os.environ.get(
-    "SYNC_BOT_EMAIL", "opensearch-skills-sync@users.noreply.github.com"
+    "SYNC_BOT_EMAIL", "83309141+opensearch-ci-bot@users.noreply.github.com"
 )
 
 

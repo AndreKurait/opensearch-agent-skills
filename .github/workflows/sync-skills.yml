@@ -107,8 +107,8 @@ jobs:
       - name: Run sync
         id: sync
         env:
-          SYNC_BOT_NAME: 'opensearch-skills-sync[bot]'
-          SYNC_BOT_EMAIL: 'opensearch-skills-sync@users.noreply.github.com'
+          SYNC_BOT_NAME: 'opensearch-ci'
+          SYNC_BOT_EMAIL: '83309141+opensearch-ci-bot@users.noreply.github.com'
           # `gh` CLI authentication for the in-script issue reporter.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
