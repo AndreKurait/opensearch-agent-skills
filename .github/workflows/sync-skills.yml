@@ -1,0 +1,97 @@
+name: Sync Skills
+
+# Mirrors skill directories from upstream repos into this one.
+#
+# Every 5 minutes the workflow runs sync/sync.py, which walks each source
+# repo's history since the last-synced commit and replays new commits that
+# touched the configured subdirectory into a destination directory here.
+# Original authorship is preserved (author field + Co-authored-by trailer)
+# and provenance trailers (Source-Repo / Source-Commit) are appended.
+#
+# If any source fails the workflow still commits + pushes successful
+# sources, then fails the job at the end so the failure is visible.
+
+on:
+  schedule:
+    # Every 5 minutes. Note: GitHub often delays scheduled workflows under
+    # load; treat this as "at least every ~10 minutes".
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Sync only this source name (optional)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry-run (no commits, no push)'
+        required: false
+        type: boolean
+        default: false
+
+# Prevent overlapping runs. If a run is in progress when the cron fires
+# again, skip the new one (a later cron tick will catch up).
+concurrency:
+  group: sync-skills
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Need full history so `git am` lands on top of the real main tip.
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@v6
+
+      - name: Cache upstream clones
+        uses: actions/cache@v4
+        with:
+          path: .sync-cache
+          key: sync-cache-${{ runner.os }}-${{ hashFiles('sync/sync.yaml') }}
+          restore-keys: |
+            sync-cache-${{ runner.os }}-
+
+      - name: Run sync
+        id: sync
+        env:
+          SYNC_BOT_NAME: 'opensearch-skills-sync[bot]'
+          SYNC_BOT_EMAIL: 'opensearch-skills-sync@users.noreply.github.com'
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [[ -n "${{ inputs.only }}" ]]; then
+            ARGS+=(--only "${{ inputs.only }}")
+          fi
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          # Run via uv with an inline script — the /// script header in
+          # sync.py pulls pyyaml into an ephemeral env.
+          uv run --script sync/sync.py "${ARGS[@]}"
+
+      - name: Push
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "origin/${GITHUB_REF_NAME}" HEAD; then
+            echo "No new commits to push."
+            exit 0
+          fi
+          # Fast-forward push. If main moved underneath us between the
+          # checkout and now, fail loudly — next cron tick will retry
+          # cleanly from a fresh checkout.
+          git push origin "HEAD:${GITHUB_REF_NAME}"
