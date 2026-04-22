@@ -8,4 +8,9 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=9.0.3"]
+dev = [
+    "pytest>=9.0.3",
+    # Runtime deps of sync/sync.py — needed so tests can import it.
+    "pyyaml",
+    "skills-ref>=0.1.1",
+]
