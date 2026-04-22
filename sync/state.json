@@ -1,5 +1,12 @@
 {
   "sources": {
+    "anthropic-skill-creator::skills/skill-creator->skills/external/skill-creator": {
+      "branch": "main",
+      "dest_path": "skills/external/skill-creator",
+      "last_sha": "b9e19e6f44773509fbdd7001d77ff41a49a486c1",
+      "src_path": "skills/skill-creator",
+      "url": "https://github.com/anthropics/skills.git"
+    },
     "opensearch-migrations::skills->skills/external/opensearch-migrations": {
       "branch": "main",
       "dest_path": "skills/external/opensearch-migrations",
