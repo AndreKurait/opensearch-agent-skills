@@ -1,7 +1,11 @@
 ---
 name: opensearch-migrations-overview
 description: High-level orientation for the opensearch-migrations project — what it is, the component layout (RFS, Traffic Capture, CDK), and how the modules fit together. Use as a starting point when an agent first enters the repo.
-tags: [opensearch-migrations, orientation, architecture]
+metadata:
+  tags:
+    - opensearch-migrations
+    - orientation
+    - architecture
 ---
 
 # opensearch-migrations — quick orientation

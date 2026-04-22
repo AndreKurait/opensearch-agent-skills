@@ -1,7 +1,12 @@
 ---
 name: opensearch-migrations-solr-backfill
 description: Develop and debug the Solr-to-OpenSearch backfill pipeline. Covers the Solr reader chain (SolrCore -> SegmentReader -> Document), the index-name mapping, and the fixture cache pitfalls that silently break tests.
-tags: [opensearch-migrations, solr, backfill, lucene]
+metadata:
+  tags:
+    - opensearch-migrations
+    - solr
+    - backfill
+    - lucene
 ---
 
 # Solr-to-OpenSearch backfill
