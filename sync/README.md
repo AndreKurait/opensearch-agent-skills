@@ -5,13 +5,14 @@ from upstream repos into this one.
 
 ## Files
 
-- `sync.yaml` — list of upstream sources (repo URL, branch, source path,
-  destination path). Add one entry per upstream.
-- `sync.py` — the sync engine. Runs on a schedule via GitHub Actions; can
-  also be invoked locally.
-- `state.json` — last-synced upstream commit SHA per source. Committed to
-  the repo so subsequent runs are incremental. Do not hand-edit unless
-  you also want to reset the import window.
+- `sources/*.yaml` — one file per upstream source (repo URL, branch,
+  source path, destination path). One-file-per-source keeps merge
+  conflicts localized when multiple sources are added in parallel.
+- `sync.py` — the sync engine. Runs on a schedule via GitHub Actions;
+  can also be invoked locally.
+- `state.json` — last-synced upstream commit SHA per source. Committed
+  to the repo so subsequent runs are incremental. Do not hand-edit
+  unless you also want to reset the import window.
 
 ## What the sync does
 
@@ -28,31 +29,44 @@ On each run, for every source:
    - `git am --directory=<dest_path>` applies that patch under the
      destination path in this repo. `git am` preserves the **original
      author** and sets the **committer** to the sync bot.
-   - `git commit --amend` appends provenance trailers:
+   - `git commit --amend` rewrites the subject to
+     `[<source-name>] <original subject>` (LLVM-monorepo style) and
+     appends provenance trailers:
      ```
      Source-Repo:   <upstream url>
      Source-Commit: <upstream sha>
      Co-authored-by: <original author>
      Signed-off-by: <sync bot>
      ```
-5. Update `state.json` and commit the advance. Push is handled by the
-   workflow.
+     Re-runs are idempotent — an already-prefixed subject is not
+     re-prefixed.
+5. Validate the resulting dest tree against the Agent Skills Spec. A
+   spec violation rolls back this source's imports and opens a tracking
+   issue.
+6. Update `state.json` and commit the advance as
+   `[<source-name>] chore(sync): advance state to <sha>`. Push is
+   handled by the workflow.
 
-Original commit messages, subjects, dates, and authorship are preserved.
-The GitHub contributor graph for this repo will credit upstream authors.
+Original commit messages (minus the one-line subject prefix), dates,
+and authorship are preserved. The GitHub contributor graph for this
+repo credits upstream authors.
 
 ## Adding a new source
 
-Edit `sync.yaml`:
+Create a new file under `sources/`, named after the source:
 
 ```yaml
-sources:
-  - name: some-project                               # stable identifier; used in state key
-    url: https://github.com/org/some-project.git
-    branch: main
-    src_path: skills                                 # subdir in upstream to mirror
-    dest_path: skills/external/some-project          # where it lands here
+# sync/sources/some-project.yaml
+name: some-project                              # stable id; used in state key and commit prefix
+url: https://github.com/org/some-project.git
+branch: main
+src_path: skills                                # subdir in upstream to mirror
+dest_path: skills/external/some-project         # where it lands here
 ```
+
+Files are loaded in lexicographic order, so the filename doubles as the
+sync-order knob if you ever need one. Duplicate `name:` across files is
+a hard error.
 
 Then either wait for the cron tick, or trigger the workflow manually
 (Actions → "Sync Skills" → Run workflow).
@@ -68,15 +82,24 @@ uv run --script sync/sync.py --only some-project
 
 # Dry-run (list what would be imported, don't commit)
 uv run --script sync/sync.py --dry-run
+
+# Custom sources directory (useful for tests)
+uv run --script sync/sync.py --sources-dir path/to/sources
 ```
 
 ## Failure handling
 
 Each source is processed independently. A failure (bad patch, upstream
-fetch error, conflict) aborts any in-progress `git am`, hard-resets that
-source's imports, and moves on. Successful sources still commit. The
-script exits nonzero if any source failed, so CI marks the run failed —
-but the good commits are already in HEAD and will be pushed.
+fetch error, conflict, spec-validation violation) aborts any in-progress
+`git am`, hard-resets that source's imports, and moves on. Successful
+sources still commit. The script exits nonzero if any source failed, so
+CI marks the run failed — but the good commits are already in HEAD and
+will be pushed.
+
+Failed sources open (or update) a GitHub issue labelled
+`sync-failure` + `sync-source:<name>`. The issue stays open while the
+source keeps failing with the same error (no comment spam); a new error
+posts a comment; a successful sync auto-closes the issue.
 
 ## Resetting a source
 

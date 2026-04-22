@@ -62,7 +62,7 @@ jobs:
           # Separate cache key from the production sync so a broken PR
           # config can't poison the main-branch cache.
           path: .sync-cache
-          key: validate-sync-cache-${{ runner.os }}-${{ hashFiles('sync/sync.yaml') }}
+          key: validate-sync-cache-${{ runner.os }}-${{ hashFiles('sync/sources/*.yaml') }}
           restore-keys: |
             validate-sync-cache-${{ runner.os }}-
 

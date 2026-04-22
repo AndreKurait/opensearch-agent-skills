@@ -1,0 +1,16 @@
+# Sync source: opensearch-migrations
+#
+# One file per source keeps merge conflicts localized when multiple
+# sources are added in parallel. Schema:
+#
+#   name:      unique short name (also used as state key and LLVM-style
+#              commit prefix: `[name] <upstream subject>`)
+#   url:       upstream git URL
+#   branch:    upstream branch to track
+#   src_path:  subdirectory in the upstream repo whose history we import
+#   dest_path: where that subdirectory lands in this repo
+name: opensearch-migrations
+url: https://github.com/AndreKurait/opensearch-migrations.git
+branch: main
+src_path: skills
+dest_path: skills/external/opensearch-migrations

@@ -8,7 +8,7 @@ Skill sync — import skill subdirectories from upstream repos into this one.
 
 How it works
 ------------
-For each entry in sync/sync.yaml:
+For each source file in sync/sources/*.yaml:
 
   1. Shallow-ish fetch of the upstream repo into a cache dir under
      .sync-cache/<name> (persistent across runs for speed).
@@ -42,10 +42,10 @@ Exit code is nonzero iff at least one source failed.
 
 Usage
 -----
-  uv run python sync/sync.py                     # sync all sources
-  uv run python sync/sync.py --only NAME         # sync a single source
-  uv run python sync/sync.py --dry-run           # show what would change
-  uv run python sync/sync.py --config path.yaml  # custom config
+  uv run python sync/sync.py                          # sync all sources
+  uv run python sync/sync.py --only NAME              # sync a single source
+  uv run python sync/sync.py --dry-run                # show what would change
+  uv run python sync/sync.py --sources-dir path/      # custom sources dir
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ import yaml  # type: ignore
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = REPO_ROOT / ".sync-cache"
 STATE_FILE = REPO_ROOT / "sync" / "state.json"
-DEFAULT_CONFIG = REPO_ROOT / "sync" / "sync.yaml"
+DEFAULT_SOURCES_DIR = REPO_ROOT / "sync" / "sources"
 
 SYNC_BOT_NAME = os.environ.get("SYNC_BOT_NAME", "opensearch-skills-sync[bot]")
 SYNC_BOT_EMAIL = os.environ.get(
@@ -116,6 +116,29 @@ def ensure_git_identity(repo: Path) -> None:
     """Set the committer identity for the destination repo."""
     run(["git", "config", "user.name", SYNC_BOT_NAME], cwd=repo)
     run(["git", "config", "user.email", SYNC_BOT_EMAIL], cwd=repo)
+
+
+def prefix_subject(message: str, source_name: str) -> str:
+    """
+    Return `message` with an LLVM-style `[source_name] ` prefix on the
+    subject line, unless it already starts with that exact prefix
+    (making re-runs idempotent).
+
+    Only the subject (first line) is rewritten; body + trailers are left
+    intact. An empty message is returned as-is — `git am` already rejects
+    those upstream.
+    """
+    if not message:
+        return message
+    prefix = f"[{source_name}] "
+    newline, _, rest = message.partition("\n")
+    subject = newline
+    if subject.startswith(prefix):
+        return message
+    new_subject = prefix + subject
+    if rest == "" and "\n" not in message:
+        return new_subject
+    return new_subject + "\n" + rest
 
 
 # ---------- data model ----------
@@ -358,7 +381,7 @@ def import_commit(
             trailers[3],
         ],
         cwd=dest_repo,
-        input_text=orig_message + "\n",
+        input_text=prefix_subject(orig_message, source.name) + "\n",
     )
     new_message = new_message_proc.stdout
 
@@ -538,7 +561,7 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
             pass
         else:
             msg = (
-                f"chore(sync): advance {source.name} state to {head_sha[:12]}\n\n"
+                f"[{source.name}] chore(sync): advance state to {head_sha[:12]}\n\n"
                 f"Source-Repo: {source.url}\n"
                 f"Source-Branch: {source.branch}\n"
                 f"Source-Commit: {sha}\n"
@@ -888,29 +911,83 @@ def report_results_to_github(results: list[SourceResult]) -> None:
                 log(f"issue-reporter: failed to close #{number} for removed source {src_name!r}: {rc.stderr.strip()}")
 
 
+def load_sources_from_dir(sources_dir: Path) -> list["Source"]:
+    """
+    Load sources from `sources_dir` — one YAML file per source.
+
+    Each file must be a mapping with at least `name`, `url`, `src_path`,
+    `dest_path` at the top level. `sources:` list-of-entries files are
+    also accepted for back-compat and for the rare case where a file
+    defines multiple sources that share context.
+
+    Files are loaded in lexicographic order so sync order is deterministic
+    and reviewable. Hidden files and non-`.yaml` / non-`.yml` files are
+    ignored. Duplicate source names across files are a hard error.
+    """
+    if not sources_dir.exists() or not sources_dir.is_dir():
+        raise FileNotFoundError(f"sources directory not found: {sources_dir}")
+
+    files = sorted(
+        p for p in sources_dir.iterdir()
+        if p.is_file() and p.suffix in (".yaml", ".yml") and not p.name.startswith(".")
+    )
+
+    sources: list[Source] = []
+    seen: dict[str, Path] = {}
+    for path in files:
+        with path.open() as f:
+            doc = yaml.safe_load(f)
+        if doc is None:
+            continue
+        if isinstance(doc, dict) and "sources" in doc:
+            entries = doc.get("sources") or []
+        elif isinstance(doc, dict):
+            entries = [doc]
+        else:
+            raise ValueError(
+                f"{path}: top-level must be a mapping "
+                f"(single source) or {{sources: [...]}}"
+            )
+        for entry in entries:
+            src = Source.from_dict(entry)
+            if src.name in seen:
+                raise ValueError(
+                    f"duplicate source name {src.name!r}: "
+                    f"defined in both {seen[src.name]} and {path}"
+                )
+            seen[src.name] = path
+            sources.append(src)
+    return sources
+
+
 # ---------- main ----------
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    ap.add_argument(
+        "--sources-dir",
+        type=Path,
+        default=DEFAULT_SOURCES_DIR,
+        help="directory containing one YAML file per source (default: sync/sources/)",
+    )
     ap.add_argument("--only", type=str, default=None, help="sync only this source name")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    cfg_path: Path = args.config
-    if not cfg_path.exists():
-        log(f"config not found: {cfg_path}")
+    sources_dir: Path = args.sources_dir
+    try:
+        sources = load_sources_from_dir(sources_dir)
+    except FileNotFoundError as e:
+        log(str(e))
+        return 2
+    except ValueError as e:
+        log(f"config error: {e}")
         return 2
 
-    with cfg_path.open() as f:
-        cfg = yaml.safe_load(f)
-
-    sources_raw = cfg.get("sources") or []
-    if not sources_raw:
-        log("no sources defined, nothing to do")
+    if not sources:
+        log(f"no sources defined under {sources_dir}, nothing to do")
         return 0
 
-    sources = [Source.from_dict(s) for s in sources_raw]
     if args.only:
         sources = [s for s in sources if s.name == args.only]
         if not sources:

@@ -64,7 +64,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .sync-cache
-          key: sync-cache-${{ runner.os }}-${{ hashFiles('sync/sync.yaml') }}
+          key: sync-cache-${{ runner.os }}-${{ hashFiles('sync/sources/*.yaml') }}
           restore-keys: |
             sync-cache-${{ runner.os }}-
 
