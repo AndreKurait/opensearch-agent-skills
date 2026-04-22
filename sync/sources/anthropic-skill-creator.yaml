@@ -1,0 +1,19 @@
+# Sync source: anthropic-skill-creator
+#
+# Mirrors Anthropic's canonical skill-creator skill from the public
+# anthropics/skills repo. Demo / dogfood source — proves the sync works
+# against a non-Andre-owned upstream with real history.
+#
+# Schema (see sync/README.md for the full description):
+#   name:      unique short name (state key + LLVM-style commit prefix)
+#   url:       upstream git URL
+#   branch:    upstream branch to track
+#   src_path:  subdirectory in the upstream repo whose history we import
+#   dest_path: where that subdirectory lands in this repo
+name: anthropic-skill-creator
+url: https://github.com/anthropics/skills.git
+branch: main
+src_path: skills/skill-creator
+# dest_path's leaf MUST match the upstream SKILL.md `name:` field
+# ('skill-creator'); the Agent Skills Spec validator enforces this.
+dest_path: skills/external/skill-creator
