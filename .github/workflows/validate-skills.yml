@@ -27,6 +27,9 @@ on:
       - 'sync/**'
       - '.github/workflows/validate-skills.yml'
       - '.github/workflows/sync-skills.yml'
+  # Allows sync-skills.yml to re-dispatch validation against a PR branch
+  # after the bot pushes to it (GITHUB_TOKEN pushes don't retrigger pull_request).
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -53,23 +53,37 @@ repo credits upstream authors.
 
 ## Adding a new source
 
-Create a new file under `sources/`, named after the source:
+The whole flow is: **drop one YAML file into `sources/`, push a PR,
+done.** No manual workflow dispatches, no local sync run required.
 
-```yaml
-# sync/sources/some-project.yaml
-name: some-project                              # stable id; used in state key and commit prefix
-url: https://github.com/org/some-project.git
-branch: main
-src_path: skills                                # subdir in upstream to mirror
-dest_path: skills/external/some-project         # where it lands here
-```
+1. Create `sync/sources/<short-name>.yaml` (~20 lines; copy any
+   existing file as a template):
+
+   ```yaml
+   # sync/sources/some-project.yaml
+   name: some-project                              # stable id; used in state key and commit prefix
+   url: https://github.com/org/some-project.git
+   branch: main
+   src_path: skills                                # subdir in upstream to mirror
+   dest_path: skills/external/some-project         # where it lands here
+   ```
+
+2. Commit and push on a branch, open a PR.
+
+3. `Sync Skills` auto-fires on the PR (it watches `sync/sources/**`).
+   It clones the upstream, replays the history that touched `src_path`
+   into `dest_path`, pushes those commits onto your PR branch, and
+   re-dispatches CI + dry-run validation against the new HEAD.
+
+4. Review the bot's added commits, squash or leave as-is when merging.
 
 Files are loaded in lexicographic order, so the filename doubles as the
 sync-order knob if you ever need one. Duplicate `name:` across files is
 a hard error.
 
-Then either wait for the cron tick, or trigger the workflow manually
-(Actions → "Sync Skills" → Run workflow).
+PRs opened from forks skip the auto-push (GitHub won't let workflows
+write to forks) but still run dry-run validation, so config mistakes
+surface before merge.
 
 ## Running locally
 
