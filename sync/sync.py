@@ -51,6 +51,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -492,6 +493,265 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
         return result
 
 
+# ---------- github issue reporter ----------
+#
+# On failure we open (or update) a GitHub issue in the destination repo so
+# the failure is visible without someone having to watch Actions. Design:
+#
+#   - Primary dedupe key is the pair of labels (sync-failure, sync-source:<name>).
+#     A single open issue per failing source. Multiple source failures ->
+#     multiple issues. An issue is auto-created the first time a source
+#     fails and stays open across subsequent failures of the same source.
+#
+#   - The current error hash is stored in the issue body as an HTML comment
+#     marker. On re-failure with the SAME error, we stay quiet (no new
+#     comment) — the open issue itself is the signal. On re-failure with a
+#     DIFFERENT error, we post a comment with the new error details and
+#     update the marker. Prevents spam when a source is stuck in the same
+#     mode, still surfaces meaningfully changed failures.
+#
+#   - When a previously-failing source comes back up-to-date or syncs
+#     successfully, we close all matching open issues with a comment.
+#
+#   - All network + gh calls are wrapped so issue-tracker failures never
+#     affect the sync exit code. If gh is unavailable or unauthenticated
+#     (e.g. local dev), the reporter logs a skip line and returns.
+#
+# We shell out to `gh` rather than hitting the REST API directly because
+# it's already on GitHub-hosted runners and handles auth from GITHUB_TOKEN
+# automatically via the GH_TOKEN env var set in the workflow.
+
+SYNC_FAILURE_LABEL = "sync-failure"
+SOURCE_LABEL_PREFIX = "sync-source:"
+ERROR_HASH_MARKER_RE = re.compile(r"<!-- sync-error-hash: ([0-9a-f]{12}) -->")
+
+
+def _gh_available(repo: str) -> bool:
+    """Check gh CLI is installed and authed for the target repo."""
+    if not shutil.which("gh"):
+        return False
+    # `gh auth status` exits 0 if authed. We pass --hostname to be explicit.
+    r = run(["gh", "auth", "status"], check=False)
+    if r.returncode != 0:
+        return False
+    # Verify we can talk to the repo (catches missing scope / wrong token).
+    r = run(["gh", "repo", "view", repo, "--json", "name"], check=False)
+    return r.returncode == 0
+
+
+def _error_hash(source_name: str, err: str) -> str:
+    """
+    Hash a normalized form of the error so that "same class of failure"
+    produces the same hash across runs. We strip volatile bits:
+      - absolute paths under /home, /tmp, /runner, /github (CI artifacts)
+      - 7-40 hex SHAs
+      - ISO-ish timestamps and epoch seconds
+      - line/column numbers in tracebacks
+    """
+    norm = err
+    norm = re.sub(r"/(home|tmp|runner|github|Users|var)/[^\s'\"]+", "<path>", norm)
+    norm = re.sub(r"\b[0-9a-f]{7,40}\b", "<sha>", norm)
+    norm = re.sub(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^ ]*", "<ts>", norm)
+    norm = re.sub(r'line \d+', "line <n>", norm)
+    h = hashlib.sha256(f"{source_name}\0{norm}".encode()).hexdigest()
+    return h[:12]
+
+
+def _find_open_issue(repo: str, source_name: str) -> dict | None:
+    """
+    Return the single open issue for this source, or None. If multiple are
+    open (shouldn't happen, but be defensive), return the newest.
+    """
+    label_args = [
+        "--label", SYNC_FAILURE_LABEL,
+        "--label", f"{SOURCE_LABEL_PREFIX}{source_name}",
+    ]
+    r = run(
+        ["gh", "issue", "list", "--repo", repo, "--state", "open",
+         *label_args, "--json", "number,title,body,updatedAt", "--limit", "10"],
+        check=False,
+    )
+    if r.returncode != 0:
+        log(f"issue-reporter: gh issue list failed: {r.stderr.strip()}")
+        return None
+    try:
+        issues = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not issues:
+        return None
+    # Newest first by updatedAt
+    issues.sort(key=lambda i: i.get("updatedAt", ""), reverse=True)
+    return issues[0]
+
+
+def _ensure_labels(repo: str, names: Iterable[str]) -> None:
+    """
+    Create any missing labels. `gh label create` is idempotent-ish — it
+    errors if the label exists, so we suppress that. Safe to call every run.
+    """
+    for name in names:
+        color = "B60205" if name == SYNC_FAILURE_LABEL else "D4C5F9"
+        run(
+            ["gh", "label", "create", name, "--repo", repo,
+             "--color", color, "--description", f"Auto-managed by sync/sync.py"],
+            check=False,
+        )
+
+
+def _format_issue_body(source: Source, err: str, err_hash: str, run_url: str | None) -> str:
+    # Keep the error payload bounded — very long tracebacks get truncated
+    # (still recorded in full in the Actions log).
+    MAX_ERR = 6000
+    err_trimmed = err if len(err) <= MAX_ERR else err[:MAX_ERR] + "\n…[truncated]"
+    lines = [
+        f"The skill-sync job failed while mirroring `{source.name}`.",
+        "",
+        f"- **Upstream:** {source.url} (branch `{source.branch}`)",
+        f"- **Upstream path:** `{source.src_path}`",
+        f"- **Destination:** `{source.dest_path}`",
+    ]
+    if run_url:
+        lines.append(f"- **Workflow run:** {run_url}")
+    lines += [
+        "",
+        "## Error",
+        "",
+        "```",
+        err_trimmed,
+        "```",
+        "",
+        "---",
+        "",
+        "This issue is auto-managed by `sync/sync.py`. It will be closed "
+        "automatically the next time this source syncs successfully. If the "
+        "error signature changes, a new comment will be posted here.",
+        "",
+        f"<!-- sync-error-hash: {err_hash} -->",
+    ]
+    return "\n".join(lines)
+
+
+def _open_or_update_failure_issue(
+    repo: str, source: Source, err: str, run_url: str | None
+) -> None:
+    err_hash = _error_hash(source.name, err)
+    existing = _find_open_issue(repo, source.name)
+
+    if existing is None:
+        # First failure for this source (or any prior issues were closed).
+        _ensure_labels(repo, [SYNC_FAILURE_LABEL, f"{SOURCE_LABEL_PREFIX}{source.name}"])
+        body = _format_issue_body(source, err, err_hash, run_url)
+        title = f"[sync] {source.name}: mirror failed"
+        r = run(
+            ["gh", "issue", "create", "--repo", repo,
+             "--title", title, "--body", body,
+             "--label", SYNC_FAILURE_LABEL,
+             "--label", f"{SOURCE_LABEL_PREFIX}{source.name}"],
+            check=False,
+        )
+        if r.returncode == 0:
+            log(f"issue-reporter: opened issue for {source.name}: {r.stdout.strip()}")
+        else:
+            log(f"issue-reporter: failed to open issue for {source.name}: {r.stderr.strip()}")
+        return
+
+    # An open issue exists. Decide whether to stay silent or post an update.
+    number = existing["number"]
+    prior_hash_match = ERROR_HASH_MARKER_RE.search(existing.get("body") or "")
+    prior_hash = prior_hash_match.group(1) if prior_hash_match else None
+
+    if prior_hash == err_hash:
+        log(f"issue-reporter: #{number} already tracks this failure mode for "
+            f"{source.name} (hash {err_hash}); no comment posted")
+        return
+
+    # Error changed — update the issue body's hash marker and post a
+    # comment summarizing the new failure signature.
+    old_body = existing.get("body") or ""
+    if prior_hash_match:
+        new_body = ERROR_HASH_MARKER_RE.sub(f"<!-- sync-error-hash: {err_hash} -->", old_body)
+    else:
+        new_body = old_body.rstrip() + f"\n\n<!-- sync-error-hash: {err_hash} -->\n"
+    run(
+        ["gh", "issue", "edit", str(number), "--repo", repo, "--body", new_body],
+        check=False,
+    )
+
+    MAX_ERR = 6000
+    err_trimmed = err if len(err) <= MAX_ERR else err[:MAX_ERR] + "\n…[truncated]"
+    comment_lines = ["The failure signature changed."]
+    if run_url:
+        comment_lines.append(f"Workflow run: {run_url}")
+    comment_lines += ["", "```", err_trimmed, "```"]
+    comment = "\n".join(comment_lines)
+    r = run(
+        ["gh", "issue", "comment", str(number), "--repo", repo, "--body", comment],
+        check=False,
+    )
+    if r.returncode == 0:
+        log(f"issue-reporter: updated #{number} for {source.name} (new hash {err_hash})")
+    else:
+        log(f"issue-reporter: failed to comment on #{number}: {r.stderr.strip()}")
+
+
+def _close_recovered_issue(repo: str, source: Source, run_url: str | None) -> None:
+    existing = _find_open_issue(repo, source.name)
+    if existing is None:
+        return
+    number = existing["number"]
+    body_lines = ["Sync recovered — closing automatically."]
+    if run_url:
+        body_lines.append(f"Workflow run: {run_url}")
+    r = run(
+        ["gh", "issue", "close", str(number), "--repo", repo,
+         "--comment", "\n".join(body_lines)],
+        check=False,
+    )
+    if r.returncode == 0:
+        log(f"issue-reporter: closed #{number} — {source.name} recovered")
+    else:
+        log(f"issue-reporter: failed to close #{number}: {r.stderr.strip()}")
+
+
+def report_results_to_github(results: list[SourceResult]) -> None:
+    """
+    Open/update/close issues in the destination GitHub repo based on the
+    per-source sync results. No-op if we're not in a GitHub context or gh
+    isn't authenticated. Never raises — issue-tracker plumbing MUST NOT
+    affect the sync exit code.
+    """
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        log("issue-reporter: GITHUB_REPOSITORY not set; skipping")
+        return
+    try:
+        if not _gh_available(repo):
+            log(f"issue-reporter: gh unavailable or not authed for {repo}; skipping")
+            return
+    except Exception as e:  # pragma: no cover - defensive
+        log(f"issue-reporter: gh availability check errored: {e}; skipping")
+        return
+
+    # Build a link to the current workflow run if we're in CI.
+    run_url: str | None = None
+    server = os.environ.get("GITHUB_SERVER_URL")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if server and run_id:
+        run_url = f"{server}/{repo}/actions/runs/{run_id}"
+
+    for r in results:
+        try:
+            if r.status == "failed":
+                err_text = "\n".join(r.errors) if r.errors else (r.message or "unknown error")
+                _open_or_update_failure_issue(repo, r.source, err_text, run_url)
+            elif r.status in ("synced", "up-to-date"):
+                _close_recovered_issue(repo, r.source, run_url)
+            # status == "skipped" -> do nothing
+        except Exception as e:  # pragma: no cover
+            log(f"issue-reporter: unexpected error handling {r.source.name}: {e}")
+
+
 # ---------- main ----------
 
 def main() -> int:
@@ -540,6 +800,16 @@ def main() -> int:
         log(line)
         if r.status == "failed":
             exit_code = 1
+
+    # Open/update/close GitHub issues based on results. Best-effort:
+    # never affects exit code, silently skips in non-GitHub contexts.
+    # Disabled under --dry-run so local rehearsals don't touch the tracker.
+    if not args.dry_run:
+        try:
+            report_results_to_github(results)
+        except Exception as e:  # pragma: no cover - absolute belt-and-suspenders
+            log(f"issue-reporter: top-level error swallowed: {e}")
+
     return exit_code
 
 

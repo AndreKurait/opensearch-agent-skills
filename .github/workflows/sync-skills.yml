@@ -36,6 +36,9 @@ concurrency:
 
 permissions:
   contents: write
+  # Needed so sync/sync.py can open/update/close failure-tracking issues
+  # via `gh issue ...`. The reporter silently skips if auth is missing.
+  issues: write
 
 jobs:
   sync:
@@ -70,6 +73,8 @@ jobs:
         env:
           SYNC_BOT_NAME: 'opensearch-skills-sync[bot]'
           SYNC_BOT_EMAIL: 'opensearch-skills-sync@users.noreply.github.com'
+          # `gh` CLI authentication for the in-script issue reporter.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           ARGS=()
