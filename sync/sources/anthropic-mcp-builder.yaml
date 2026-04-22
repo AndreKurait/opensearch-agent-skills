@@ -1,0 +1,20 @@
+# Sync source: anthropic-mcp-builder
+#
+# Mirrors Anthropic's canonical mcp-builder skill from the public
+# anthropics/skills repo. Second dogfood source — proves the
+# auto-sync-on-PR trigger (added in #9) fires on net-new sources
+# without a separate workflow_dispatch.
+#
+# Schema (see sync/README.md for the full description):
+#   name:      unique short name (state key + LLVM-style commit prefix)
+#   url:       upstream git URL
+#   branch:    upstream branch to track
+#   src_path:  subdirectory in the upstream repo whose history we import
+#   dest_path: where that subdirectory lands in this repo
+name: anthropic-mcp-builder
+url: https://github.com/anthropics/skills.git
+branch: main
+src_path: skills/mcp-builder
+# dest_path's leaf MUST match the upstream SKILL.md `name:` field
+# ('mcp-builder'); the Agent Skills Spec validator enforces this.
+dest_path: skills/external/mcp-builder
