@@ -1,0 +1,173 @@
+name: Sync Skills
+
+# Mirrors skill directories from upstream repos into this one.
+#
+# Every hour the workflow runs `opensearch-skills-sync` (the CLI
+# shipped by sync-bot/), which walks each source repo's history since
+# the last-synced commit and replays new commits that touched the
+# configured subdirectory into a destination directory here. Original
+# authorship is preserved (author field + Co-authored-by trailer) and
+# provenance trailers (Source-Repo / Source-Commit) are appended.
+#
+# If any source fails the workflow still commits + pushes successful
+# sources, then fails the job at the end so the failure is visible.
+
+on:
+  schedule:
+    # Every hour at minute 0. Note: GitHub often delays scheduled workflows
+    # under load; treat this as "at least every ~2 hours".
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Sync only this source name (optional)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry-run (no commits, no push)'
+        required: false
+        type: boolean
+        default: false
+  # Auto-fire on PRs that add/edit a source YAML or touch the sync
+  # engine. This lets a contributor just commit
+  # `sync/sources/<name>.yaml` and have the mirrored content appear on
+  # their branch without any manual dispatch.
+  #
+  # Ignores PRs from forks (head.repo != base.repo) since GITHUB_TOKEN
+  # can't push to a fork. Forked-PR authors still get dry-run validation
+  # via validate-skills.yml.
+  pull_request:
+    paths:
+      - 'sync/sources/**'
+      - 'sync-bot/**'
+      - '.github/workflows/sync-skills.yml'
+
+# Prevent overlapping runs on the same ref. Cron and PR runs use
+# different groups so a slow cron doesn't block PR feedback.
+concurrency:
+  group: sync-skills-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  # Needed so the sync engine can open/update/close failure-tracking
+  # issues on the default branch, or post PR comments on non-default
+  # branches, via `gh ...`. The reporter silently skips if auth is
+  # missing.
+  issues: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Skip fork PRs: GITHUB_TOKEN can't push to the contributor's fork
+    # and can't re-dispatch checks on it either. Dry-run still runs in
+    # validate-skills.yml on the fork PR, so config breakage is caught.
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # On cron / workflow_dispatch this checks out the branch the
+          # workflow was dispatched on. On pull_request we need the PR
+          # head (not the merge ref) because we're going to push back to
+          # the PR branch.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          # Need full history so `git am` lands on top of the real branch tip.
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install sync-bot (locked)
+        # --frozen: CI fails if sync-bot/uv.lock is stale relative to
+        # sync-bot/pyproject.toml. Guard against a dep bump sneaking in
+        # without a refreshed lockfile.
+        working-directory: sync-bot
+        run: uv sync --frozen
+
+      - name: Cache upstream clones
+        uses: actions/cache@v4
+        with:
+          path: .sync-cache
+          key: sync-cache-${{ runner.os }}-${{ hashFiles('sync/sources/*.yaml') }}
+          restore-keys: |
+            sync-cache-${{ runner.os }}-
+
+      - name: Resolve target branch
+        id: target
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "branch=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "branch=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run sync
+        id: sync
+        env:
+          SYNC_BOT_NAME: 'opensearch-ci'
+          SYNC_BOT_EMAIL: '83309141+opensearch-ci-bot@users.noreply.github.com'
+          # `gh` CLI authentication for the in-script issue reporter.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [[ -n "${{ inputs.only }}" ]]; then
+            ARGS+=(--only "${{ inputs.only }}")
+          fi
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          uv run --project sync-bot opensearch-skills-sync "${ARGS[@]}"
+
+      - name: Push
+        id: push
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          BRANCH='${{ steps.target.outputs.branch }}'
+          if git diff --quiet "origin/${BRANCH}" HEAD; then
+            echo "No new commits to push."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fast-forward push. If the branch moved underneath us between
+          # the checkout and now, fail loudly — next cron tick (or the
+          # PR's next push) will retry cleanly.
+          git push origin "HEAD:${BRANCH}"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # After we push bot commits to a PR branch, GitHub's infinite-loop
+      # guard suppresses the normal pull_request re-run of CI and
+      # validate-skills (because the push was authenticated with
+      # GITHUB_TOKEN). Re-dispatch them explicitly so PR checks reflect
+      # the post-sync tree.
+      - name: Re-trigger PR checks on post-sync HEAD
+        if: ${{ github.event_name == 'pull_request' && steps.push.outputs.pushed == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH='${{ steps.target.outputs.branch }}'
+          # workflow_dispatch requires the workflow to define that trigger.
+          for wf in ci.yml validate-skills.yml sync-bot-ci.yml; do
+            if gh workflow view "$wf" --json on --jq '.on | keys[]' 2>/dev/null | grep -q workflow_dispatch; then
+              echo "Dispatching $wf on $BRANCH"
+              gh workflow run "$wf" --ref "$BRANCH" || echo "Dispatch of $wf failed (non-fatal)"
+            else
+              echo "Skipping $wf (no workflow_dispatch trigger; add one to enable post-sync rechecks)"
+            fi
+          done
