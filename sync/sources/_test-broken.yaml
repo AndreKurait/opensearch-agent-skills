@@ -1,0 +1,12 @@
+# TEMPORARY TEST SOURCE — DO NOT MERGE TO MAIN
+#
+# Used by the PR-comment-reporter smoke test. Points at a nonexistent
+# GitHub repo so sync.py fails during the clone step, forcing the
+# reporter to exercise its non-default-branch code path (PR comment).
+#
+# Delete this file before merging.
+name: test-broken
+url: https://github.com/AndreKurait/this-repo-does-not-exist-pr-comment-smoke.git
+branch: main
+src_path: skills/nothing
+dest_path: skills/external/test-broken
