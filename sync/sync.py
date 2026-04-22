@@ -480,35 +480,36 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
         cache, head_sha = fetch_upstream(source)
         last = state["sources"].get(source.state_key, {}).get("last_sha")
 
-        if last == head_sha:
-            result.message = f"already at {head_sha[:12]}"
-            return result
-
+        # `last_sha` semantics: the newest upstream commit that actually
+        # touched `src_path` and has been imported into this repo. It is
+        # NOT the upstream branch tip — we deliberately ignore upstream
+        # commits that don't touch the tracked path so state.json stays
+        # idempotent across unrelated upstream churn (no state-only
+        # commits every time an unrelated file changes upstream).
+        #
+        # `head_sha` is only used as the end-anchor of the path-filtered
+        # log range; we never persist it.
         shas = commits_touching_path(cache, source.src_path, last, head_sha)
         if not shas:
-            # No commits touched this path in the range, but upstream head
-            # advanced. Still bump state so we don't re-scan forever.
+            # No commits in `last..head` touched our src_path. Nothing to
+            # import, nothing to persist. Next run will re-scan the same
+            # (cheap, path-filtered) range and also no-op until upstream
+            # actually modifies src_path again.
             result.status = "up-to-date"
-            result.new_head = head_sha
             result.message = (
-                f"no commits touched {source.src_path} in "
-                f"{(last or 'INIT')[:12]}..{head_sha[:12]}"
+                f"no commits touched {source.src_path} since "
+                f"{(last or 'INIT')[:12]} (upstream tip {head_sha[:12]})"
             )
-            if not dry_run:
-                state["sources"].setdefault(source.state_key, {}).update(
-                    {
-                        "last_sha": head_sha,
-                        "url": source.url,
-                        "branch": source.branch,
-                        "src_path": source.src_path,
-                        "dest_path": source.dest_path,
-                    }
-                )
             return result
+
+        # New last_sha = newest commit that touched src_path. That's the
+        # tail of the --reverse log (== shas[-1]).
+        new_last_sha = shas[-1]
 
         log(
             f"{source.name}: {len(shas)} upstream commit(s) to import "
-            f"(from {(last or 'INIT')[:12]} to {head_sha[:12]})"
+            f"(from {(last or 'INIT')[:12]} to {new_last_sha[:12]}; "
+            f"upstream tip {head_sha[:12]})"
         )
         if dry_run:
             for sha in shas:
@@ -518,7 +519,7 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
                 log(f"  would import {sha[:12]}  {subj}")
             result.status = "synced"
             result.commits_imported = len(shas)
-            result.new_head = head_sha
+            result.new_head = new_last_sha
             return result
 
         ensure_git_identity(dest_repo)
@@ -546,11 +547,14 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
                 format_validation_failures(dest_tree, validation_failures)
             )
 
-        # Always update state.json, even if every imported commit ended up empty —
-        # otherwise we'd rescan them next run.
+        # Advance state to the newest path-touching commit. If every
+        # imported commit came out empty under the relative path (e.g. a
+        # pure rename OUT of src_path — tracked by log but producing no
+        # patch for `git am`), we still bump `last_sha` so we don't
+        # rescan the same range next run.
         state["sources"].setdefault(source.state_key, {}).update(
             {
-                "last_sha": head_sha,
+                "last_sha": new_last_sha,
                 "url": source.url,
                 "branch": source.branch,
                 "src_path": source.src_path,
@@ -567,10 +571,10 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
             pass
         else:
             msg = (
-                f"[{source.name}] chore(sync): advance state to {head_sha[:12]}\n\n"
+                f"[{source.name}] chore(sync): advance state to {new_last_sha[:12]}\n\n"
                 f"Source-Repo: {source.url}\n"
                 f"Source-Branch: {source.branch}\n"
-                f"Source-Commit: {sha}\n"
+                f"Source-Commit: {new_last_sha}\n"
                 f"Signed-off-by: {SYNC_BOT_NAME} <{SYNC_BOT_EMAIL}>\n"
             )
             run(
@@ -586,10 +590,11 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
 
         result.status = "synced" if imported > 0 else "up-to-date"
         result.commits_imported = imported
-        result.new_head = head_sha
+        result.new_head = new_last_sha
         result.message = (
             f"imported {imported}/{len(shas)} commits "
-            f"(upstream at {head_sha[:12]})"
+            f"(tracked-path tip now {new_last_sha[:12]}, "
+            f"upstream tip {head_sha[:12]})"
         )
         return result
     except Exception as e:  # noqa: BLE001
