@@ -14,4 +14,6 @@ name: anthropic-skill-creator
 url: https://github.com/anthropics/skills.git
 branch: main
 src_path: skills/skill-creator
-dest_path: skills/external/anthropic-skill-creator
+# dest_path's leaf MUST match the upstream SKILL.md `name:` field
+# ('skill-creator'); the Agent Skills Spec validator enforces this.
+dest_path: skills/external/skill-creator
