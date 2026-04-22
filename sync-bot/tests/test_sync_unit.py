@@ -244,3 +244,63 @@ def test_format_validation_failures_mentions_each_skill(sync_mod):
     assert "sk1/SKILL.md" in text
     assert "sk2/SKILL.md" in text
     assert "err a" in text and "err b" in text and "err c" in text
+
+
+def test_source_from_dict_squash_defaults_true(sync_mod):
+    src = sync_mod.Source.from_dict(
+        {
+            "name": "n",
+            "url": "u",
+            "src_path": "a",
+            "dest_path": "b",
+        }
+    )
+    assert src.squash is True, "squash must default to True for new configs"
+
+
+def test_source_from_dict_squash_explicit_false(sync_mod):
+    src = sync_mod.Source.from_dict(
+        {
+            "name": "n",
+            "url": "u",
+            "src_path": "a",
+            "dest_path": "b",
+            "squash": False,
+        }
+    )
+    assert src.squash is False
+
+
+def test_source_from_dict_squash_string_variants(sync_mod):
+    for val, expected in [
+        ("true", True),
+        ("false", False),
+        ("yes", True),
+        ("no", False),
+        ("1", True),
+        ("0", False),
+    ]:
+        src = sync_mod.Source.from_dict(
+            {
+                "name": "n",
+                "url": "u",
+                "src_path": "a",
+                "dest_path": "b",
+                "squash": val,
+            }
+        )
+        assert src.squash is expected, f"squash={val!r} parsed wrong"
+
+
+def test_source_from_dict_squash_invalid_raises(sync_mod):
+    import pytest as _pytest  # local import; file has pytest imported globally
+    with _pytest.raises(ValueError, match="squash"):
+        sync_mod.Source.from_dict(
+            {
+                "name": "n",
+                "url": "u",
+                "src_path": "a",
+                "dest_path": "b",
+                "squash": 42,
+            }
+        )

@@ -184,18 +184,38 @@ class Source:
     branch: str = "main"
     src_path: str = ""
     dest_path: str = ""
+    # When True (default), collapse all imported commits for THIS source in
+    # a single sync run into one squashed commit on dest. Per-source: other
+    # sources in the same run are squashed independently. All original
+    # authors are retained as Co-authored-by trailers on the squashed commit
+    # so attribution survives on GitHub. Set to False to preserve one-to-one
+    # per-commit history (previous behaviour).
+    squash: bool = True
 
     @classmethod
     def from_dict(cls, d: dict) -> "Source":
         missing = [k for k in ("name", "url", "src_path", "dest_path") if not d.get(k)]
         if missing:
             raise ValueError(f"source entry missing fields: {missing}: {d}")
+        squash_raw = d.get("squash", True)
+        # Accept bools and common string forms; anything else is a config error.
+        if isinstance(squash_raw, bool):
+            squash = squash_raw
+        elif isinstance(squash_raw, str) and squash_raw.lower() in (
+            "true", "false", "yes", "no", "1", "0",
+        ):
+            squash = squash_raw.lower() in ("true", "yes", "1")
+        else:
+            raise ValueError(
+                f"source {d.get('name')!r} has invalid `squash` value: {squash_raw!r}"
+            )
         return cls(
             name=d["name"],
             url=d["url"],
             branch=d.get("branch", "main"),
             src_path=d["src_path"].strip("/"),
             dest_path=d["dest_path"].strip("/"),
+            squash=squash,
         )
 
     @property
@@ -502,6 +522,122 @@ def format_validation_failures(
     return "\n".join(lines)
 
 
+def squash_imported_commits(
+    dest_repo: Path, source: Source, pre_head: str, imported_shas: list[str]
+) -> str:
+    """
+    Collapse the per-commit imports on top of `pre_head` into a single
+    commit for THIS source. Called only when `source.squash` is True and
+    at least one commit was imported.
+
+    Design:
+      - `git reset --soft pre_head` rewinds HEAD, keeping the aggregate
+        tree + index from all imports. Equivalent to an all-at-once
+        `git am` of the combined diff.
+      - The new commit's message lists every imported upstream commit,
+        accumulates all original authors as de-duplicated Co-authored-by
+        trailers, and records provenance for the newest upstream commit.
+      - Author of the squashed commit is the sync bot (there is no single
+        upstream author for a multi-commit squash). Individual authors
+        remain visible via Co-authored-by, which is exactly how GitHub
+        attributes squash-merges on the contributor graph.
+      - Only commits between `pre_head..HEAD` are squashed. Other sources
+        that ran earlier in the same workflow are untouched (their commits
+        are older than this source's `pre_head`).
+
+    Returns the new HEAD sha after squashing.
+    """
+    # Enumerate the imported commits on dest (not the upstream shas) so we
+    # can read the finalised trailers/authors that import_commit produced.
+    dest_shas = run(
+        ["git", "rev-list", "--reverse", f"{pre_head}..HEAD"],
+        cwd=dest_repo,
+    ).stdout.split()
+    if not dest_shas:
+        # Nothing to squash — caller guarded against this but be safe.
+        return pre_head
+
+    # Collect authors + subjects per imported commit for the message body.
+    entries: list[tuple[str, str, str, str]] = []  # (short, subject, an, ae)
+    for dsha in dest_shas:
+        meta = run(
+            ["git", "show", "--no-patch", "--format=%h%x00%s%x00%an%x00%ae", dsha],
+            cwd=dest_repo,
+        ).stdout.rstrip("\n")
+        parts = meta.split("\x00", 3)
+        if len(parts) < 4:
+            raise RuntimeError(f"unexpected git show output during squash: {meta!r}")
+        entries.append((parts[0], parts[1], parts[2], parts[3]))
+
+    # Soft-reset to collapse all imports into a single staged change.
+    run(["git", "reset", "--soft", pre_head], cwd=dest_repo)
+
+    # Compose the squashed message.
+    newest_upstream = imported_shas[-1]
+    oldest_upstream = imported_shas[0]
+    n = len(imported_shas)
+    if n == 1:
+        subject = f"[{source.name}] sync: import upstream {newest_upstream[:12]}"
+    else:
+        subject = (
+            f"[{source.name}] sync: import {n} upstream commits "
+            f"({oldest_upstream[:12]}..{newest_upstream[:12]})"
+        )
+
+    body_lines: list[str] = [""]
+    body_lines.append(f"Squashed {n} upstream commit(s) touching {source.src_path!r}:")
+    body_lines.append("")
+    for _dsh, subj, _an, _ae in entries:
+        body_lines.append(f"  - {subj}")
+    body_lines.append("")
+
+    # De-dupe authors preserving order-of-first-appearance.
+    seen: set[tuple[str, str]] = set()
+    co_authors: list[tuple[str, str]] = []
+    for _dsh, _subj, an, ae in entries:
+        key = (an, ae.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        co_authors.append((an, ae))
+
+    # Build trailers: provenance (newest commit pins state) + per-author
+    # Co-authored-by + bot sign-off. `git interpret-trailers` handles the
+    # canonical trailer-block formatting.
+    trailer_args: list[str] = []
+    trailer_args += ["--trailer", f"Source-Repo: {source.url}"]
+    trailer_args += ["--trailer", f"Source-Branch: {source.branch}"]
+    trailer_args += ["--trailer", f"Source-Commit: {newest_upstream}"]
+    for an, ae in co_authors:
+        trailer_args += ["--trailer", f"Co-authored-by: {an} <{ae}>"]
+    trailer_args += [
+        "--trailer",
+        f"Signed-off-by: {SYNC_BOT_NAME} <{SYNC_BOT_EMAIL}>",
+    ]
+
+    message_pre = subject + "\n" + "\n".join(body_lines)
+    message_proc = run(
+        ["git", "interpret-trailers", "--if-exists", "addIfDifferent", *trailer_args],
+        cwd=dest_repo,
+        input_text=message_pre if message_pre.endswith("\n") else message_pre + "\n",
+    )
+    message = message_proc.stdout
+
+    # Commit the squashed tree. Author = sync bot; per-author attribution
+    # lives in Co-authored-by trailers.
+    run(
+        ["git", "commit", "-m", message, "--allow-empty"],
+        cwd=dest_repo,
+        env={
+            "GIT_COMMITTER_NAME": SYNC_BOT_NAME,
+            "GIT_COMMITTER_EMAIL": SYNC_BOT_EMAIL,
+            "GIT_AUTHOR_NAME": SYNC_BOT_NAME,
+            "GIT_AUTHOR_EMAIL": SYNC_BOT_EMAIL,
+        },
+    )
+    return run(["git", "rev-parse", "HEAD"], cwd=dest_repo).stdout.strip()
+
+
 def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> SourceResult:
     result = SourceResult(source=source, status="up-to-date")
     try:
@@ -554,12 +690,14 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
         pre_head = run(["git", "rev-parse", "HEAD"], cwd=dest_repo).stdout.strip()
 
         imported = 0
+        imported_upstream_shas: list[str] = []
         for sha in shas:
             new_sha = import_commit(cache, dest_repo, source, sha)
             if new_sha is None:
                 log(f"  skipped (empty under relative path): {sha[:12]}")
                 continue
             imported += 1
+            imported_upstream_shas.append(sha)
             log(f"  imported {sha[:12]} -> {new_sha[:12]}")
 
         # Validate the post-import dest tree against the Agent Skills Spec.
@@ -573,6 +711,22 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
         if validation_failures:
             raise RuntimeError(
                 format_validation_failures(dest_tree, validation_failures)
+            )
+
+        # Optional per-source squash. Runs AFTER validation so a failed
+        # validation still triggers the outer reset-to-pre_head and leaves
+        # state.last_sha pinned — behaviour is unchanged from the
+        # non-squash path on failure. On success, we collapse only THIS
+        # source's imports (pre_head..HEAD) into a single commit; other
+        # sources processed earlier in the same run are untouched because
+        # their commits sit below pre_head.
+        if source.squash and imported > 0:
+            squash_imported_commits(
+                dest_repo, source, pre_head, imported_upstream_shas
+            )
+            log(
+                f"  squashed {imported} import commit(s) into one "
+                f"[{source.name}] commit"
             )
 
         # Advance state to the newest path-touching commit. If every
