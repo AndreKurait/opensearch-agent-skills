@@ -714,6 +714,31 @@ def _close_recovered_issue(repo: str, source: Source, run_url: str | None) -> No
         log(f"issue-reporter: failed to close #{number}: {r.stderr.strip()}")
 
 
+def _all_open_failure_issues(repo: str) -> list[dict]:
+    """Return every open sync-failure issue on the repo (all sources)."""
+    r = run(
+        ["gh", "issue", "list", "--repo", repo, "--state", "open",
+         "--label", SYNC_FAILURE_LABEL,
+         "--json", "number,title,labels,body,updatedAt", "--limit", "100"],
+        check=False,
+    )
+    if r.returncode != 0:
+        log(f"issue-reporter: gh issue list (all) failed: {r.stderr.strip()}")
+        return []
+    try:
+        return json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def _source_name_from_issue(issue: dict) -> str | None:
+    for lbl in issue.get("labels") or []:
+        name = lbl.get("name", "")
+        if name.startswith(SOURCE_LABEL_PREFIX):
+            return name[len(SOURCE_LABEL_PREFIX):]
+    return None
+
+
 def report_results_to_github(results: list[SourceResult]) -> None:
     """
     Open/update/close issues in the destination GitHub repo based on the
@@ -750,6 +775,34 @@ def report_results_to_github(results: list[SourceResult]) -> None:
             # status == "skipped" -> do nothing
         except Exception as e:  # pragma: no cover
             log(f"issue-reporter: unexpected error handling {r.source.name}: {e}")
+
+    # Close issues for sources that no longer exist in the config. When a
+    # user removes a bad source, sync_one is never called for it — so we'd
+    # otherwise leave the issue open forever. Skip this sweep when only a
+    # subset of sources ran (e.g. workflow_dispatch with `--only`), since
+    # we can't distinguish "removed from config" from "not in this run".
+    if os.environ.get("SYNC_FULL_RUN") == "1":
+        seen_source_names = {r.source.name for r in results}
+        for issue in _all_open_failure_issues(repo):
+            src_name = _source_name_from_issue(issue)
+            if not src_name or src_name in seen_source_names:
+                continue
+            number = issue["number"]
+            comment = (
+                "Source was removed from the sync configuration — closing "
+                "automatically."
+            )
+            if run_url:
+                comment += f"\n\nWorkflow run: {run_url}"
+            rc = run(
+                ["gh", "issue", "close", str(number), "--repo", repo,
+                 "--comment", comment],
+                check=False,
+            )
+            if rc.returncode == 0:
+                log(f"issue-reporter: closed #{number} — source {src_name!r} removed from config")
+            else:
+                log(f"issue-reporter: failed to close #{number} for removed source {src_name!r}: {rc.stderr.strip()}")
 
 
 # ---------- main ----------
@@ -805,6 +858,11 @@ def main() -> int:
     # never affects exit code, silently skips in non-GitHub contexts.
     # Disabled under --dry-run so local rehearsals don't touch the tracker.
     if not args.dry_run:
+        # Signal to the reporter that this run processed every configured
+        # source, so it's safe to close issues for sources no longer in
+        # the config. Under --only we processed a subset, so skip that sweep.
+        if not args.only:
+            os.environ["SYNC_FULL_RUN"] = "1"
         try:
             report_results_to_github(results)
         except Exception as e:  # pragma: no cover - absolute belt-and-suspenders
