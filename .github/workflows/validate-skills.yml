@@ -1,0 +1,80 @@
+name: Validate Skills Sync (dry-run)
+
+# Runs sync/sync.py in --dry-run mode on every PR and on every branch push
+# (except main, which is covered by the scheduled Sync Skills workflow).
+#
+# Purpose: catch broken sync configuration — unreachable upstreams, wrong
+# branch names, typo'd src_path, etc. — before the change lands on main
+# and the cron starts failing every 5 minutes.
+#
+# Dry-run contract:
+#   * sync/sync.py still exits 1 if any source fails to mirror, so CI is
+#     red when the config is broken.
+#   * No commits are created, nothing is pushed, and the issue reporter
+#     is fully skipped (main() gates it on `not args.dry_run`).
+
+on:
+  pull_request:
+    # Re-run when the workflow itself or anything the sync depends on changes.
+    paths:
+      - 'sync/**'
+      - '.github/workflows/validate-skills.yml'
+      - '.github/workflows/sync-skills.yml'
+  push:
+    branches-ignore:
+      - main
+    paths:
+      - 'sync/**'
+      - '.github/workflows/validate-skills.yml'
+      - '.github/workflows/sync-skills.yml'
+
+permissions:
+  contents: read
+
+# If the same branch gets a rapid burst of pushes, cancel stale runs.
+concurrency:
+  group: validate-skills-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # sync.py only needs history of its own repo for origin/main diffs,
+          # not for the upstream repos (which it clones fresh). Keep shallow.
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@v6
+
+      - name: Cache upstream clones
+        uses: actions/cache@v4
+        with:
+          # Separate cache key from the production sync so a broken PR
+          # config can't poison the main-branch cache.
+          path: .sync-cache
+          key: validate-sync-cache-${{ runner.os }}-${{ hashFiles('sync/sync.yaml') }}
+          restore-keys: |
+            validate-sync-cache-${{ runner.os }}-
+
+      - name: Run sync (dry-run)
+        env:
+          # Bot identity is set even in dry-run because sync.py creates
+          # commits locally (just never pushes them) to compute diffs.
+          SYNC_BOT_NAME: 'opensearch-skills-sync[bot]'
+          SYNC_BOT_EMAIL: 'opensearch-skills-sync@users.noreply.github.com'
+          # Deliberately NOT setting GH_TOKEN: dry-run skips the issue
+          # reporter anyway, and omitting the token makes that guarantee
+          # mechanical (no accidental gh-CLI mutations from a PR).
+        run: |
+          set -euo pipefail
+          uv run --script sync/sync.py --dry-run
