@@ -8,7 +8,7 @@ tags: [opensearch-migrations, orientation, architecture]
 
 `opensearch-migrations` is a toolkit for migrating from Elasticsearch (5.x
 through 8.x) and legacy OpenSearch clusters to newer OpenSearch / Amazon
-OpenSearch Service targets with minimal downtime.
+OpenSearch Service targets with minimal downtime, end-to-end.
 
 ## Top-level modules you'll touch most
 
