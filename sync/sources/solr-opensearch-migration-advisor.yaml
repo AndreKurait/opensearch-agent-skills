@@ -1,0 +1,15 @@
+# Sync source: solr-opensearch-migration-advisor
+#
+# Mirrors the Solr -> OpenSearch migration advisor skill from
+# AndreKurait/opensearch-migrations (AIAdvisor/skills/) — fork carrying
+# the agentskills.io spec-compliance fix until upstream merges it.
+#
+# `squash` is omitted, so it defaults to true (see PR #15): every sync
+# run collapses this source's imports into a single [<name>] commit on
+# main, with all original authors preserved as Co-authored-by trailers.
+name: solr-opensearch-migration-advisor
+url: https://github.com/AndreKurait/opensearch-migrations.git
+branch: main
+src_path: AIAdvisor/skills/solr-opensearch-migration-advisor
+# dest_path's leaf must match the upstream SKILL.md `name:` field.
+dest_path: skills/solr-opensearch-migration-advisor
