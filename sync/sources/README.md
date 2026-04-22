@@ -28,6 +28,13 @@ HEAD. Review the result, then merge.
 #   branch:    upstream branch to track
 #   src_path:  subdirectory in the upstream repo whose history we import
 #   dest_path: where that subdirectory lands in this repo
+#   squash:    optional (default: true). When true, all commits imported
+#              for THIS source in a single sync run are collapsed into
+#              one commit on main. Per-source: unrelated sources in the
+#              same run get their own squashed commits. Original authors
+#              are preserved as Co-authored-by trailers so GitHub
+#              attribution survives. Set to false to keep one-to-one
+#              per-commit history (noisier but exact).
 name: <short-name>
 url: https://github.com/<org>/<repo>.git
 branch: main

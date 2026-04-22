@@ -60,7 +60,17 @@ def _last_commit(repo: Path, *fmt_args: str) -> str:
     return r.stdout
 
 
-def _make_source(sync_mod, name: str, upstream: Path, src_path: str, dest_path: str):
+def _make_source(
+    sync_mod,
+    name: str,
+    upstream: Path,
+    src_path: str,
+    dest_path: str,
+    squash: bool = False,
+):
+    # Default squash=False in tests so the pre-existing fine-grained
+    # assertions (per-commit author preservation, subject prefix on each
+    # import) keep working. Squash-mode tests opt in explicitly.
     return sync_mod.Source.from_dict(
         {
             "name": name,
@@ -68,6 +78,7 @@ def _make_source(sync_mod, name: str, upstream: Path, src_path: str, dest_path: 
             "branch": "main",
             "src_path": src_path,
             "dest_path": dest_path,
+            "squash": squash,
         }
     )
 
@@ -423,3 +434,218 @@ def test_sync_one_validation_failure_resets_dest_and_keeps_state(
     assert src.state_key not in state["sources"]
     # Dest tree must be clean (the partial import file is gone).
     assert not (sync_mod.dest_repo / "imported" / "bad" / "SKILL.md").exists()
+
+
+# ---------- squash mode ----------
+
+
+def test_sync_one_squash_collapses_multiple_commits_into_one(
+    sync_mod, make_upstream, commit_file
+):
+    """
+    With squash=True, a single sync run that imports N upstream commits
+    must produce exactly ONE import commit on dest (plus the state-bump
+    chore commit on top). The squashed commit:
+      - has `[src-a] sync: import N upstream commits` subject,
+      - lists every upstream subject in its body,
+      - carries a Co-authored-by trailer for every distinct original
+        author,
+      - pins Source-Commit to the newest upstream sha.
+    """
+    up = make_upstream("up")
+    commit_file(
+        up,
+        "skills/alpha/SKILL.md",
+        SKILL_FRONTMATTER.format(name="alpha"),
+        "add alpha skill",
+        author_name="Alice",
+        author_email="alice@example.invalid",
+    )
+    commit_file(
+        up,
+        "skills/alpha/SKILL.md",
+        SKILL_FRONTMATTER.format(name="alpha") + "\nExtra body\n",
+        "tweak alpha",
+        author_name="Bob",
+        author_email="bob@example.invalid",
+    )
+    sha3 = commit_file(
+        up,
+        "skills/alpha/SKILL.md",
+        SKILL_FRONTMATTER.format(name="alpha") + "\nMore extra body\n",
+        "polish alpha",
+        author_name="Alice",  # duplicate author — must only appear once
+        author_email="alice@example.invalid",
+    )
+
+    src = _make_source(
+        sync_mod, "src-a", up, "skills", "imported", squash=True
+    )
+    state = {"version": 1, "sources": {}}
+    pre_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=sync_mod.dest_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+    result = sync_mod.sync_one(src, state, sync_mod.dest_repo, dry_run=False)
+    assert result.status == "synced", result.message
+    assert result.commits_imported == 3
+
+    # Between pre_head and HEAD there must be EXACTLY two commits:
+    # the squashed import + the state-bump chore.
+    commits = subprocess.run(
+        ["git", "rev-list", "--reverse", f"{pre_head}..HEAD"],
+        cwd=sync_mod.dest_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.split()
+    assert len(commits) == 2, (
+        f"expected 2 commits (squash + state-bump), got {len(commits)}"
+    )
+
+    # Inspect the squashed import commit (not the chore on top).
+    imported_sha = commits[0]
+    show = subprocess.run(
+        ["git", "show", "--no-patch", "--format=%s%x00%b", imported_sha],
+        cwd=sync_mod.dest_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    subject, body = show.split("\x00", 1)
+    subject = subject.rstrip("\n")
+
+    assert subject.startswith("[src-a] sync: import 3 upstream commits ")
+    assert "add alpha skill" in body
+    assert "tweak alpha" in body
+    assert "polish alpha" in body
+    # Provenance pins to newest upstream.
+    assert f"Source-Commit: {sha3}" in body
+    assert "Source-Repo:" in body
+    # Both distinct authors are co-authors; Alice only once despite two commits.
+    assert "Co-authored-by: Alice <alice@example.invalid>" in body
+    assert "Co-authored-by: Bob <bob@example.invalid>" in body
+    assert body.count("Co-authored-by: Alice") == 1
+    # Bot sign-off present.
+    assert "Signed-off-by: test-bot <test-bot@example.invalid>" in body
+
+
+def test_sync_one_squash_rerun_with_no_changes_is_up_to_date(
+    sync_mod, make_upstream, commit_file
+):
+    """Squash mode must still be idempotent — a rerun with no upstream
+    changes is a no-op, HEAD does not advance."""
+    up = make_upstream("up")
+    commit_file(
+        up,
+        "skills/alpha/SKILL.md",
+        SKILL_FRONTMATTER.format(name="alpha"),
+        "add alpha",
+    )
+    src = _make_source(
+        sync_mod, "src-a", up, "skills", "imported", squash=True
+    )
+    state = {"version": 1, "sources": {}}
+
+    sync_mod.sync_one(src, state, sync_mod.dest_repo, dry_run=False)
+    head1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=sync_mod.dest_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+    result2 = sync_mod.sync_one(src, state, sync_mod.dest_repo, dry_run=False)
+    head2 = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=sync_mod.dest_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+    assert result2.status == "up-to-date"
+    assert head1 == head2, "rerun with no changes must not advance HEAD"
+
+
+def test_sync_one_squash_is_per_source_not_cross_source(
+    sync_mod, make_upstream, commit_file
+):
+    """
+    Squash is scoped to ONE source's imports. Running two sources in
+    sequence must produce one squashed commit per source (plus their
+    state-bumps) — the second source's squash must NOT eat the first
+    source's commits.
+    """
+    up_a = make_upstream("up-a")
+    commit_file(
+        up_a,
+        "skills/alpha/SKILL.md",
+        SKILL_FRONTMATTER.format(name="alpha"),
+        "add alpha v1",
+    )
+    commit_file(
+        up_a,
+        "skills/alpha/SKILL.md",
+        SKILL_FRONTMATTER.format(name="alpha") + "\nbody\n",
+        "add alpha v2",
+    )
+
+    up_b = make_upstream("up-b")
+    commit_file(
+        up_b,
+        "skills/beta/SKILL.md",
+        SKILL_FRONTMATTER.format(name="beta"),
+        "add beta v1",
+    )
+    commit_file(
+        up_b,
+        "skills/beta/SKILL.md",
+        SKILL_FRONTMATTER.format(name="beta") + "\nbody\n",
+        "add beta v2",
+    )
+
+    src_a = _make_source(
+        sync_mod, "src-a", up_a, "skills", "imported-a", squash=True
+    )
+    src_b = _make_source(
+        sync_mod, "src-b", up_b, "skills", "imported-b", squash=True
+    )
+    state = {"version": 1, "sources": {}}
+
+    pre_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=sync_mod.dest_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+    r1 = sync_mod.sync_one(src_a, state, sync_mod.dest_repo, dry_run=False)
+    r2 = sync_mod.sync_one(src_b, state, sync_mod.dest_repo, dry_run=False)
+    assert r1.status == "synced" and r1.commits_imported == 2
+    assert r2.status == "synced" and r2.commits_imported == 2
+
+    # Collect all commit subjects between pre_head..HEAD.
+    subjects = subprocess.run(
+        ["git", "log", "--format=%s", f"{pre_head}..HEAD", "--reverse"],
+        cwd=sync_mod.dest_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.splitlines()
+
+    # Expected 4 commits total: squash-a, chore-a, squash-b, chore-b.
+    assert len(subjects) == 4, subjects
+    assert subjects[0].startswith("[src-a] sync: import 2 upstream commits")
+    assert subjects[1].startswith("[src-a] chore(sync):")
+    assert subjects[2].startswith("[src-b] sync: import 2 upstream commits")
+    assert subjects[3].startswith("[src-b] chore(sync):")
+    # Both skill trees present on disk.
+    assert (sync_mod.dest_repo / "imported-a" / "alpha" / "SKILL.md").exists()
+    assert (sync_mod.dest_repo / "imported-b" / "beta" / "SKILL.md").exists()
