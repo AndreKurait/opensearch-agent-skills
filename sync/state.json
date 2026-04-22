@@ -1,4 +1,12 @@
 {
-  "version": 1,
-  "sources": {}
+  "sources": {
+    "solr-opensearch-migration-advisor::AIAdvisor/skills/solr-opensearch-migration-advisor->skills/solr-opensearch-migration-advisor": {
+      "branch": "main",
+      "dest_path": "skills/solr-opensearch-migration-advisor",
+      "last_sha": "1d3d1d672b745545f509b4ce4dbef0cbed2716cd",
+      "src_path": "AIAdvisor/skills/solr-opensearch-migration-advisor",
+      "url": "https://github.com/AndreKurait/opensearch-migrations.git"
+    }
+  },
+  "version": 1
 }
