@@ -1,28 +1,29 @@
 """Shared fixtures for sync tests.
 
-These tests exercise sync/sync.py end-to-end with real git commands against
-synthetic local repositories in tmp_path. No network, no GitHub API — the
-module-level path constants (REPO_ROOT, STATE_FILE, CACHE_DIR) are
-monkeypatched to point into tmp_path.
+These tests exercise skills_sync.main end-to-end with real git commands
+against synthetic local repositories in tmp_path. No network, no GitHub
+API — the module-level path constants (REPO_ROOT, STATE_FILE, CACHE_DIR)
+are monkeypatched to point into tmp_path.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
 
 
-# Make the sync package importable regardless of where pytest is run from.
-REPO = Path(__file__).resolve().parents[1]
-SYNC_DIR = REPO / "sync"
-if str(SYNC_DIR) not in sys.path:
-    sys.path.insert(0, str(SYNC_DIR))
+# Allow `import skills_sync` even when the package hasn't been installed
+# (e.g. raw `pytest` invocation from the sync-bot/ directory). Normally
+# `uv run pytest` handles this via the pyproject's `pythonpath = ["src"]`,
+# but keeping the fallback makes ad-hoc invocation robust.
+SYNC_BOT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = SYNC_BOT_ROOT / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 
 def _git(cwd: Path, *args: str, env: dict | None = None) -> str:
@@ -140,15 +141,23 @@ def dest_repo(tmp_path):
 @pytest.fixture
 def sync_mod(tmp_path, dest_repo, monkeypatch):
     """
-    Import sync.sync with its module-level REPO_ROOT / STATE_FILE /
+    Import skills_sync.main with its module-level REPO_ROOT / STATE_FILE /
     CACHE_DIR redirected into tmp_path. Any previously-imported copy is
     evicted so the constants are re-computed from scratch. Yields the
     module with an attached `.dest_repo` attribute for convenience.
-    """
-    # Drop any cached version so re-patching REPO_ROOT takes effect.
-    monkeypatch.delitem(sys.modules, "sync", raising=False)
 
-    import sync as sync_module  # type: ignore
+    We import the concrete submodule (skills_sync.main) rather than the
+    package so monkeypatches on constants like SYNC_BOT_NAME actually
+    affect the bindings that the sync functions read at runtime (the
+    package __init__ merely re-exports them, and patching the re-export
+    has no effect on the originals).
+    """
+    # Drop any cached copies so re-patching REPO_ROOT / constants takes
+    # effect when _resolve_repo_root() is re-evaluated on import.
+    for mod in ("skills_sync", "skills_sync.main"):
+        monkeypatch.delitem(sys.modules, mod, raising=False)
+
+    import skills_sync.main as sync_module  # type: ignore
 
     # Redirect module-level paths into the test sandbox. We rebase to the
     # dest repo so state.json and .sync-cache live inside it — mirrors

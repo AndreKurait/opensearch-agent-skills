@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["pyyaml", "skills-ref>=0.1.1"]
-# ///
 """
 Skill sync — import skill subdirectories from upstream repos into this one.
 
@@ -65,7 +61,39 @@ from typing import Iterable
 
 import yaml  # type: ignore
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+def _resolve_repo_root() -> Path:
+    """
+    Resolve the destination repo root.
+
+    Priority:
+      1. SYNC_REPO_ROOT env var (absolute path) — used by tests and for
+         out-of-tree invocations.
+      2. `git rev-parse --show-toplevel` from the current working directory —
+         matches how CI and local devs actually invoke the tool.
+      3. Fallback: the current working directory.
+
+    We intentionally do NOT derive the root from __file__ anymore: the sync
+    code lives in an installable package (sync-bot/) that may be installed
+    system-wide, while the data it manages (sync/state.json, sync/sources/)
+    still lives at the checkout root.
+    """
+    env_root = os.environ.get("SYNC_REPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if out:
+            return Path(out).resolve()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return Path.cwd().resolve()
+
+
+REPO_ROOT = _resolve_repo_root()
 CACHE_DIR = REPO_ROOT / ".sync-cache"
 STATE_FILE = REPO_ROOT / "sync" / "state.json"
 DEFAULT_SOURCES_DIR = REPO_ROOT / "sync" / "sources"

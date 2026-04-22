@@ -1,15 +1,16 @@
 name: Validate Skills Sync (dry-run)
 
-# Runs sync/sync.py in --dry-run mode on every PR and on every branch push
-# (except main, which is covered by the scheduled Sync Skills workflow).
+# Runs the skill-sync engine in --dry-run mode on every PR and on every
+# branch push (except main, which is covered by the scheduled Sync Skills
+# workflow).
 #
 # Purpose: catch broken sync configuration — unreachable upstreams, wrong
 # branch names, typo'd src_path, etc. — before the change lands on main
 # and the cron starts failing every 5 minutes.
 #
 # Dry-run contract:
-#   * sync/sync.py still exits 1 if any source fails to mirror, so CI is
-#     red when the config is broken.
+#   * `opensearch-skills-sync --dry-run` still exits 1 if any source fails
+#     to mirror, so CI is red when the config is broken.
 #   * No commits are created, nothing is pushed, and the issue reporter
 #     is fully skipped (main() gates it on `not args.dry_run`).
 
@@ -17,14 +18,16 @@ on:
   pull_request:
     # Re-run when the workflow itself or anything the sync depends on changes.
     paths:
-      - 'sync/**'
+      - 'sync/sources/**'
+      - 'sync-bot/**'
       - '.github/workflows/validate-skills.yml'
       - '.github/workflows/sync-skills.yml'
   push:
     branches-ignore:
       - main
     paths:
-      - 'sync/**'
+      - 'sync/sources/**'
+      - 'sync-bot/**'
       - '.github/workflows/validate-skills.yml'
       - '.github/workflows/sync-skills.yml'
   # Allows sync-skills.yml to re-dispatch validation against a PR branch
@@ -47,8 +50,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # sync.py only needs history of its own repo for origin/main diffs,
-          # not for the upstream repos (which it clones fresh). Keep shallow.
+          # The sync engine only needs history of its own repo for
+          # origin/main diffs, not for the upstream repos (which it
+          # clones fresh). Keep shallow.
           fetch-depth: 1
 
       - name: Set up Python
@@ -58,6 +62,13 @@ jobs:
 
       - name: Install UV
         uses: astral-sh/setup-uv@v6
+
+      - name: Install sync-bot (locked)
+        # --frozen: CI fails if sync-bot/uv.lock is stale relative to
+        # sync-bot/pyproject.toml. This is our guard against a dep bump
+        # sneaking in without a refreshed lockfile.
+        working-directory: sync-bot
+        run: uv sync --frozen
 
       - name: Cache upstream clones
         uses: actions/cache@v4
@@ -71,7 +82,7 @@ jobs:
 
       - name: Run sync (dry-run)
         env:
-          # Bot identity is set even in dry-run because sync.py creates
+          # Bot identity is set even in dry-run because the sync creates
           # commits locally (just never pushes them) to compute diffs.
           SYNC_BOT_NAME: 'opensearch-ci'
           SYNC_BOT_EMAIL: '83309141+opensearch-ci-bot@users.noreply.github.com'
@@ -80,4 +91,4 @@ jobs:
           # mechanical (no accidental gh-CLI mutations from a PR).
         run: |
           set -euo pipefail
-          uv run --script sync/sync.py --dry-run
+          uv run --project sync-bot opensearch-skills-sync --dry-run

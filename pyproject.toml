@@ -10,7 +10,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
-    # Runtime deps of sync/sync.py — needed so tests can import it.
-    "pyyaml",
-    "skills-ref>=0.1.1",
 ]
+
+# The skill-sync tool lives in sync-bot/ as a separately-versioned uv project
+# with its own dependencies (pyyaml, skills-ref) and lockfile. See
+# sync-bot/README.md for build/test instructions, or run:
+#     uv run --project sync-bot pytest
+#     uv run --project sync-bot opensearch-skills-sync --dry-run

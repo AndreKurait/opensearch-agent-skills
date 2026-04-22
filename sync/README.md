@@ -8,11 +8,15 @@ from upstream repos into this one.
 - `sources/*.yaml` — one file per upstream source (repo URL, branch,
   source path, destination path). One-file-per-source keeps merge
   conflicts localized when multiple sources are added in parallel.
-- `sync.py` — the sync engine. Runs on a schedule via GitHub Actions;
-  can also be invoked locally.
 - `state.json` — last-synced upstream commit SHA per source. Committed
   to the repo so subsequent runs are incremental. Do not hand-edit
   unless you also want to reset the import window.
+
+The sync **engine** lives in [`../sync-bot/`](../sync-bot/) as a
+dedicated uv-managed Python package (`opensearch-skills-sync`) with
+its own `pyproject.toml` / `uv.lock`. Invoke it via `uv run
+--project sync-bot opensearch-skills-sync …` — see
+`sync-bot/README.md` for details.
 
 ## What the sync does
 
@@ -89,16 +93,16 @@ surface before merge.
 
 ```bash
 # Sync all sources
-uv run --script sync/sync.py
+uv run --project sync-bot opensearch-skills-sync
 
 # Sync just one source
-uv run --script sync/sync.py --only some-project
+uv run --project sync-bot opensearch-skills-sync --only some-project
 
 # Dry-run (list what would be imported, don't commit)
-uv run --script sync/sync.py --dry-run
+uv run --project sync-bot opensearch-skills-sync --dry-run
 
 # Custom sources directory (useful for tests)
-uv run --script sync/sync.py --sources-dir path/to/sources
+uv run --project sync-bot opensearch-skills-sync --sources-dir path/to/sources
 ```
 
 ## Failure handling

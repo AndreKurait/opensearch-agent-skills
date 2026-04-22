@@ -2,11 +2,12 @@ name: Sync Skills
 
 # Mirrors skill directories from upstream repos into this one.
 #
-# Every 5 minutes the workflow runs sync/sync.py, which walks each source
-# repo's history since the last-synced commit and replays new commits that
-# touched the configured subdirectory into a destination directory here.
-# Original authorship is preserved (author field + Co-authored-by trailer)
-# and provenance trailers (Source-Repo / Source-Commit) are appended.
+# Every 5 minutes the workflow runs `opensearch-skills-sync` (the CLI
+# shipped by sync-bot/), which walks each source repo's history since
+# the last-synced commit and replays new commits that touched the
+# configured subdirectory into a destination directory here. Original
+# authorship is preserved (author field + Co-authored-by trailer) and
+# provenance trailers (Source-Repo / Source-Commit) are appended.
 #
 # If any source fails the workflow still commits + pushes successful
 # sources, then fails the job at the end so the failure is visible.
@@ -27,9 +28,10 @@ on:
         required: false
         type: boolean
         default: false
-  # Auto-fire on PRs that add/edit a source YAML. This lets a contributor
-  # just commit `sync/sources/<name>.yaml` and have the mirrored content
-  # appear on their branch without any manual dispatch.
+  # Auto-fire on PRs that add/edit a source YAML or touch the sync
+  # engine. This lets a contributor just commit
+  # `sync/sources/<name>.yaml` and have the mirrored content appear on
+  # their branch without any manual dispatch.
   #
   # Ignores PRs from forks (head.repo != base.repo) since GITHUB_TOKEN
   # can't push to a fork. Forked-PR authors still get dry-run validation
@@ -37,7 +39,7 @@ on:
   pull_request:
     paths:
       - 'sync/sources/**'
-      - 'sync/sync.py'
+      - 'sync-bot/**'
       - '.github/workflows/sync-skills.yml'
 
 # Prevent overlapping runs on the same ref. Cron and PR runs use
@@ -48,9 +50,10 @@ concurrency:
 
 permissions:
   contents: write
-  # Needed so sync/sync.py can open/update/close failure-tracking issues
-  # on the default branch, or post PR comments on non-default branches,
-  # via `gh ...`. The reporter silently skips if auth is missing.
+  # Needed so the sync engine can open/update/close failure-tracking
+  # issues on the default branch, or post PR comments on non-default
+  # branches, via `gh ...`. The reporter silently skips if auth is
+  # missing.
   issues: write
   pull-requests: write
 
@@ -86,6 +89,13 @@ jobs:
       - name: Install UV
         uses: astral-sh/setup-uv@v6
 
+      - name: Install sync-bot (locked)
+        # --frozen: CI fails if sync-bot/uv.lock is stale relative to
+        # sync-bot/pyproject.toml. Guard against a dep bump sneaking in
+        # without a refreshed lockfile.
+        working-directory: sync-bot
+        run: uv sync --frozen
+
       - name: Cache upstream clones
         uses: actions/cache@v4
         with:
@@ -120,9 +130,7 @@ jobs:
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
             ARGS+=(--dry-run)
           fi
-          # Run via uv with an inline script — the /// script header in
-          # sync.py pulls pyyaml into an ephemeral env.
-          uv run --script sync/sync.py "${ARGS[@]}"
+          uv run --project sync-bot opensearch-skills-sync "${ARGS[@]}"
 
       - name: Push
         id: push
@@ -155,9 +163,7 @@ jobs:
           set -euo pipefail
           BRANCH='${{ steps.target.outputs.branch }}'
           # workflow_dispatch requires the workflow to define that trigger.
-          # CI and validate-skills currently only use push/pull_request,
-          # so fall back to a no-op here if the workflow isn't dispatchable.
-          for wf in ci.yml validate-skills.yml; do
+          for wf in ci.yml validate-skills.yml sync-bot-ci.yml; do
             if gh workflow view "$wf" --json on --jq '.on | keys[]' 2>/dev/null | grep -q workflow_dispatch; then
               echo "Dispatching $wf on $BRANCH"
               gh workflow run "$wf" --ref "$BRANCH" || echo "Dispatch of $wf failed (non-fatal)"
