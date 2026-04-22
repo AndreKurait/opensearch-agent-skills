@@ -1,0 +1,21 @@
+# Sync source: anthropic-mcp-builder
+#
+# Mirrors Anthropic's mcp-builder skill from the public anthropics/skills
+# repo. Demonstrates the happy path of adding a new source on a PR branch:
+# when sync-skills.yml is dispatched on this branch, sync.py should
+# replay the upstream commits that touched skills/mcp-builder into
+# skills/external/mcp-builder/ and push them onto this branch.
+#
+# Schema (see sync/README.md for the full description):
+#   name:      unique short name (state key + LLVM-style commit prefix)
+#   url:       upstream git URL
+#   branch:    upstream branch to track
+#   src_path:  subdirectory in the upstream repo whose history we import
+#   dest_path: where that subdirectory lands in this repo
+name: anthropic-mcp-builder
+url: https://github.com/anthropics/skills.git
+branch: main
+src_path: skills/mcp-builder
+# dest_path's leaf MUST match the upstream SKILL.md `name:` field
+# ('mcp-builder'); the Agent Skills Spec validator enforces this.
+dest_path: skills/external/mcp-builder
