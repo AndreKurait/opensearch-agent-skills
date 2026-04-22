@@ -73,8 +73,8 @@ jobs:
         env:
           # Bot identity is set even in dry-run because sync.py creates
           # commits locally (just never pushes them) to compute diffs.
-          SYNC_BOT_NAME: 'opensearch-skills-sync[bot]'
-          SYNC_BOT_EMAIL: 'opensearch-skills-sync@users.noreply.github.com'
+          SYNC_BOT_NAME: 'opensearch-ci'
+          SYNC_BOT_EMAIL: '83309141+opensearch-ci-bot@users.noreply.github.com'
           # Deliberately NOT setting GH_TOKEN: dry-run skips the issue
           # reporter anyway, and omitting the token makes that guarantee
           # mechanical (no accidental gh-CLI mutations from a PR).
