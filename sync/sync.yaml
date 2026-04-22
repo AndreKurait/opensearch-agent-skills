@@ -21,3 +21,11 @@ sources:
     branch: main
     src_path: skills
     dest_path: skills/external/opensearch-migrations
+
+  # TEMPORARY: intentional failure to exercise the GitHub issue reporter.
+  # Remove this entry once the auto-opened issue has been verified.
+  - name: intentional-failure-test
+    url: https://github.com/AndreKurait/this-repo-does-not-exist-abc123.git
+    branch: main
+    src_path: skills
+    dest_path: skills/external/intentional-failure-test
