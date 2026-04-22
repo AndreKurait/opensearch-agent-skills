@@ -599,10 +599,23 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
         return result
 
 
-# ---------- github issue reporter ----------
+# ---------- github failure reporter ----------
 #
-# On failure we open (or update) a GitHub issue in the destination repo so
-# the failure is visible without someone having to watch Actions. Design:
+# On failure we surface the failure somewhere a human will see it, but we
+# pick the reporting channel based on where the run happened:
+#
+#   * Default branch (scheduled / dispatch on main): open/update a GitHub
+#     issue in the destination repo. Issues are persistent, labelled, and
+#     de-duped — perfect for cron failures nobody is watching.
+#
+#   * Non-default branch (dispatch on a feature branch): if an open PR
+#     exists for that branch, post a comment on the PR. Otherwise stay
+#     silent and rely on the failed workflow run itself as the signal.
+#     We explicitly avoid opening issues for PR-branch runs because they
+#     would clutter the tracker with transient failures that belong to an
+#     in-flight change.
+#
+# Issue-flow design (default branch):
 #
 #   - Primary dedupe key is the pair of labels (sync-failure, sync-source:<name>).
 #     A single open issue per failing source. Multiple source failures ->
@@ -618,6 +631,18 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
 #
 #   - When a previously-failing source comes back up-to-date or syncs
 #     successfully, we close all matching open issues with a comment.
+#
+# PR-comment flow (non-default branch):
+#
+#   - Find the open PR whose HEAD ref matches the current branch. If none,
+#     no-op (the failed action status is the signal).
+#   - Dedupe by the same <!-- sync-error-hash: ... --> marker embedded in
+#     bot comments on the PR. If the most recent sync-failure comment has
+#     the same hash as the current error, stay silent — the existing
+#     comment already describes this failure. Otherwise post a new comment.
+#   - On success/recovery we do NOT delete or resolve prior PR comments.
+#     They remain as a record of prior attempts; the green run is the
+#     recovery signal for PR authors.
 #
 #   - All network + gh calls are wrapped so issue-tracker failures never
 #     affect the sync exit code. If gh is unavailable or unauthenticated
@@ -845,12 +870,159 @@ def _source_name_from_issue(issue: dict) -> str | None:
     return None
 
 
+def _is_default_branch(repo: str) -> bool:
+    """
+    Return True iff the current GITHUB_REF_NAME matches the repo's default
+    branch. Conservative: if we can't determine either side, return False
+    (safer to post a PR comment or stay silent than to cut an issue).
+    """
+    ref_name = os.environ.get("GITHUB_REF_NAME")
+    if not ref_name:
+        return False
+    r = run(
+        ["gh", "repo", "view", repo, "--json", "defaultBranchRef"],
+        check=False,
+    )
+    if r.returncode != 0:
+        log(f"issue-reporter: gh repo view failed ({r.stderr.strip()}); "
+            "assuming non-default branch")
+        return False
+    try:
+        info = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    default = (info.get("defaultBranchRef") or {}).get("name")
+    return bool(default) and ref_name == default
+
+
+def _find_pr_for_ref(repo: str, ref_name: str) -> int | None:
+    """
+    Return the number of the (single) open PR whose head branch matches
+    ref_name, or None. Multiple-PR case is rare; we return the newest.
+    """
+    r = run(
+        ["gh", "pr", "list", "--repo", repo, "--state", "open",
+         "--head", ref_name, "--json", "number,updatedAt", "--limit", "5"],
+        check=False,
+    )
+    if r.returncode != 0:
+        log(f"issue-reporter: gh pr list failed: {r.stderr.strip()}")
+        return None
+    try:
+        prs = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not prs:
+        return None
+    prs.sort(key=lambda p: p.get("updatedAt", ""), reverse=True)
+    return prs[0].get("number")
+
+
+# A signature line we embed in every PR failure comment so we can
+# distinguish our comments from anyone else's when de-duping.
+PR_COMMENT_SIGNATURE = "<!-- sync-failure-comment -->"
+
+
+def _post_or_update_pr_comment(
+    repo: str, pr_number: int, source: "Source", err: str, run_url: str | None,
+) -> None:
+    """
+    Post a failure comment on the given PR, de-duplicated by error-hash.
+
+    We scan existing comments on the PR for any that carry our signature
+    marker AND a source-label marker for this source. If the most-recent
+    such comment's error-hash matches the current error, stay silent. Any
+    other case posts a fresh comment — we never edit old comments so the
+    chronological history of failure signatures is preserved on the PR.
+    """
+    err_hash = _error_hash(source.name, err)
+
+    # List recent comments and look for prior sync-failure comments for
+    # this source. `gh pr view --json comments` gives us the bodies.
+    r = run(
+        ["gh", "pr", "view", str(pr_number), "--repo", repo,
+         "--json", "comments"],
+        check=False,
+    )
+    prior_hash: str | None = None
+    if r.returncode == 0:
+        try:
+            data = json.loads(r.stdout or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        comments = data.get("comments") or []
+        source_marker = f"<!-- sync-source: {source.name} -->"
+        # Comments come back oldest-first; walk in reverse to find the
+        # most recent matching one.
+        for c in reversed(comments):
+            body = c.get("body") or ""
+            if PR_COMMENT_SIGNATURE in body and source_marker in body:
+                m = ERROR_HASH_MARKER_RE.search(body)
+                prior_hash = m.group(1) if m else None
+                break
+    else:
+        log(f"issue-reporter: gh pr view failed: {r.stderr.strip()}")
+
+    if prior_hash == err_hash:
+        log(f"issue-reporter: PR #{pr_number} already has a comment for "
+            f"{source.name} with the same failure signature (hash "
+            f"{err_hash}); no comment posted")
+        return
+
+    MAX_ERR = 6000
+    err_trimmed = err if len(err) <= MAX_ERR else err[:MAX_ERR] + "\n…[truncated]"
+    lines = [
+        PR_COMMENT_SIGNATURE,
+        f"<!-- sync-source: {source.name} -->",
+        f"Skill sync failed for **`{source.name}`** on this branch.",
+        "",
+        f"- **Upstream:** {source.url} (branch `{source.branch}`)",
+        f"- **Upstream path:** `{source.src_path}`",
+        f"- **Destination:** `{source.dest_path}`",
+    ]
+    if run_url:
+        lines.append(f"- **Workflow run:** {run_url}")
+    lines += [
+        "",
+        "<details><summary>Error</summary>",
+        "",
+        "```",
+        err_trimmed,
+        "```",
+        "",
+        "</details>",
+        "",
+        "_This comment is auto-posted by `sync/sync.py` when the sync job "
+        "runs on a non-default branch. No GitHub issue will be opened for "
+        "PR-branch failures._",
+        "",
+        f"<!-- sync-error-hash: {err_hash} -->",
+    ]
+    body = "\n".join(lines)
+    rc = run(
+        ["gh", "pr", "comment", str(pr_number), "--repo", repo, "--body", body],
+        check=False,
+    )
+    if rc.returncode == 0:
+        log(f"issue-reporter: commented on PR #{pr_number} for "
+            f"{source.name} (hash {err_hash})")
+    else:
+        log(f"issue-reporter: failed to comment on PR #{pr_number}: "
+            f"{rc.stderr.strip()}")
+
+
 def report_results_to_github(results: list[SourceResult]) -> None:
     """
-    Open/update/close issues in the destination GitHub repo based on the
-    per-source sync results. No-op if we're not in a GitHub context or gh
-    isn't authenticated. Never raises — issue-tracker plumbing MUST NOT
-    affect the sync exit code.
+    Surface sync outcomes in GitHub. The reporting channel depends on which
+    branch the workflow is running on:
+
+      * Default branch  -> open/update/close labelled failure issues.
+      * Non-default ref -> post (de-duplicated) comments on the PR whose
+                           HEAD matches the current ref, if one exists.
+                           No issues are opened from non-default branches.
+
+    Best-effort in every case: never affects the sync exit code, silently
+    skips in non-GitHub contexts, and swallows all gh errors.
     """
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not repo:
@@ -871,6 +1043,32 @@ def report_results_to_github(results: list[SourceResult]) -> None:
     if server and run_id:
         run_url = f"{server}/{repo}/actions/runs/{run_id}"
 
+    on_default = _is_default_branch(repo)
+    ref_name = os.environ.get("GITHUB_REF_NAME", "")
+    if not on_default:
+        log(
+            f"issue-reporter: running on non-default branch {ref_name!r}; "
+            "will route failures to PR comments instead of issues"
+        )
+        pr_number = _find_pr_for_ref(repo, ref_name) if ref_name else None
+        for r in results:
+            if r.status != "failed":
+                continue
+            if pr_number is None:
+                log(
+                    f"issue-reporter: {r.source.name} failed on {ref_name!r} "
+                    "but no open PR was found; relying on failed workflow "
+                    "status as the signal"
+                )
+                continue
+            err_text = "\n".join(r.errors) if r.errors else (r.message or "unknown error")
+            try:
+                _post_or_update_pr_comment(repo, pr_number, r.source, err_text, run_url)
+            except Exception as e:  # pragma: no cover
+                log(f"issue-reporter: unexpected error commenting on PR #{pr_number} for {r.source.name}: {e}")
+        return
+
+    # Default branch: full issue-tracker flow (open/update/close).
     for r in results:
         try:
             if r.status == "failed":

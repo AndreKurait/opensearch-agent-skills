@@ -37,8 +37,10 @@ concurrency:
 permissions:
   contents: write
   # Needed so sync/sync.py can open/update/close failure-tracking issues
-  # via `gh issue ...`. The reporter silently skips if auth is missing.
+  # on the default branch, or post PR comments on non-default branches,
+  # via `gh ...`. The reporter silently skips if auth is missing.
   issues: write
+  pull-requests: write
 
 jobs:
   sync:
