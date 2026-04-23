@@ -1,0 +1,10 @@
+# Sync source: opensearch-migrations-overview
+#
+# Mirrors the opensearch-migrations-overview skill from the
+# opensearch-migrations repo. Test-only source for end-to-end validation
+# of the sync framework on AndreKurait's fork. Not intended for upstream.
+name: opensearch-migrations-overview
+url: https://github.com/AndreKurait/opensearch-migrations.git
+branch: main
+src_path: skills/opensearch-migrations-overview
+dest_path: skills/opensearch-migrations-overview
