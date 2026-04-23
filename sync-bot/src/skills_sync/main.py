@@ -927,6 +927,16 @@ SYNC_FAILURE_LABEL = "sync-failure"
 SOURCE_LABEL_PREFIX = "sync-source:"
 ERROR_HASH_MARKER_RE = re.compile(r"<!-- sync-error-hash: ([0-9a-f]{12}) -->")
 
+# Bound the error payload embedded in issue bodies and PR comments.
+# The full traceback is still preserved in the Actions log.
+ERROR_TRUNCATE_MAX = 6000
+
+
+def _truncate_err(err: str) -> str:
+    if len(err) <= ERROR_TRUNCATE_MAX:
+        return err
+    return err[:ERROR_TRUNCATE_MAX] + "\n…[truncated]"
+
 
 def _gh_available(repo: str) -> bool:
     """Check gh CLI is installed and authed for the target repo."""
@@ -1004,8 +1014,7 @@ def _ensure_labels(repo: str, names: Iterable[str]) -> None:
 def _format_issue_body(source: Source, err: str, err_hash: str, run_url: str | None) -> str:
     # Keep the error payload bounded — very long tracebacks get truncated
     # (still recorded in full in the Actions log).
-    MAX_ERR = 6000
-    err_trimmed = err if len(err) <= MAX_ERR else err[:MAX_ERR] + "\n…[truncated]"
+    err_trimmed = _truncate_err(err)
     lines = [
         f"The skill-sync job failed while mirroring `{source.name}`.",
         "",
@@ -1080,8 +1089,7 @@ def _open_or_update_failure_issue(
         check=False,
     )
 
-    MAX_ERR = 6000
-    err_trimmed = err if len(err) <= MAX_ERR else err[:MAX_ERR] + "\n…[truncated]"
+    err_trimmed = _truncate_err(err)
     comment_lines = ["The failure signature changed."]
     if run_url:
         comment_lines.append(f"Workflow run: {run_url}")
@@ -1240,8 +1248,7 @@ def _post_or_update_pr_comment(
             f"{err_hash}); no comment posted")
         return
 
-    MAX_ERR = 6000
-    err_trimmed = err if len(err) <= MAX_ERR else err[:MAX_ERR] + "\n…[truncated]"
+    err_trimmed = _truncate_err(err)
     lines = [
         PR_COMMENT_SIGNATURE,
         f"<!-- sync-source: {source.name} -->",
