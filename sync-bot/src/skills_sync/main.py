@@ -231,6 +231,22 @@ class SourceResult:
     new_head: str = ""
     message: str = ""
     errors: list[str] = field(default_factory=list)
+    # In mode=pr, the per-source branch that sync_one left the imports on
+    # (e.g. "skills-sync/opensearch-dashboards-assistant"). Empty in mode=push.
+    # The workflow reads this to force-push and open/update a PR.
+    dest_branch: str = ""
+
+
+# Sync modes. "push" = land commits on the current branch + write state.json
+# (hub-repo behaviour: this is how opensearch-agent-skills mirrors upstream).
+# "pr"   = land commits on a per-source branch off origin/<base>, DO NOT
+#          write state.json (only the hub owns sync state), so the workflow
+#          can open/update a PR proposing the change upstream. Used when the
+#          sync engine runs FROM an upstream repo proposing itself back to
+#          the hub, or from the hub proposing changes to downstream forks.
+MODE_PUSH = "push"
+MODE_PR = "pr"
+ALL_MODES = (MODE_PUSH, MODE_PR)
 
 
 # ---------- state ----------
@@ -638,8 +654,31 @@ def squash_imported_commits(
     return run(["git", "rev-parse", "HEAD"], cwd=dest_repo).stdout.strip()
 
 
-def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> SourceResult:
+def sync_one(
+    source: Source,
+    state: dict,
+    dest_repo: Path,
+    dry_run: bool,
+    mode: str = MODE_PUSH,
+) -> SourceResult:
+    """Import one source's new commits into dest_repo.
+
+    mode=push (default): commits land on the CURRENT branch of dest_repo,
+    state.json is updated and committed. This is the hub-repo mirror path.
+
+    mode=pr: commits land on a fresh per-source branch `skills-sync/<name>`
+    that is reset to the current HEAD at the start of the run, and state.json
+    is NOT touched (the hub owns sync state, not the repo we're proposing into).
+    The workflow reads `result.dest_branch` to force-push + open/update a PR.
+    Per-source branches mean one failing source doesn't block the others, and
+    each upstream PR is independently reviewable/revertable.
+    """
+    if mode not in ALL_MODES:
+        raise ValueError(f"unknown sync mode {mode!r} (expected one of {ALL_MODES})")
     result = SourceResult(source=source, status="up-to-date")
+    # Track the branch we were on before switching, so we can restore even
+    # on failure. In push-mode this stays empty (no switching happens).
+    original_branch: str = ""
     try:
         cache, head_sha = fetch_upstream(source)
         last = state["sources"].get(source.state_key, {}).get("last_sha")
@@ -689,6 +728,24 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
         ensure_git_identity(dest_repo)
         pre_head = run(["git", "rev-parse", "HEAD"], cwd=dest_repo).stdout.strip()
 
+        # In pr-mode, isolate this source's imports on a dedicated branch
+        # `skills-sync/<name>` forked from the current HEAD. We reset the
+        # branch to HEAD each run so a prior failed/stale attempt never
+        # poisons a subsequent one — the branch is a view of "what the
+        # current base would look like WITH this source's imports applied".
+        # Switching branches must happen BEFORE any commits land, so the
+        # imports + optional squash target the per-source branch.
+        dest_branch_name = ""
+        if mode == MODE_PR:
+            original_branch = run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=dest_repo
+            ).stdout.strip()
+            dest_branch_name = f"skills-sync/{source.name}"
+            # -B creates-or-resets the branch to HEAD. Equivalent to
+            # `git branch -f NAME HEAD && git checkout NAME`.
+            run(["git", "checkout", "-B", dest_branch_name], cwd=dest_repo)
+            result.dest_branch = dest_branch_name
+
         imported = 0
         imported_upstream_shas: list[str] = []
         for sha in shas:
@@ -734,41 +791,46 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
         # pure rename OUT of src_path — tracked by log but producing no
         # patch for `git am`), we still bump `last_sha` so we don't
         # rescan the same range next run.
-        state["sources"].setdefault(source.state_key, {}).update(
-            {
-                "last_sha": new_last_sha,
-                "url": source.url,
-                "branch": source.branch,
-                "src_path": source.src_path,
-                "dest_path": source.dest_path,
-            }
-        )
-        save_state(state)
-        # Commit the state bump (on top of the imported commits, or as its
-        # own commit if nothing was imported). Use a simple identity-signed
-        # sync commit.
-        run(["git", "add", str(STATE_FILE.relative_to(REPO_ROOT))], cwd=dest_repo)
-        if run_ok(["git", "diff", "--cached", "--quiet"], cwd=dest_repo):
-            # no state change (first-run identical) -- nothing to commit
-            pass
-        else:
-            msg = (
-                f"[{source.name}] chore(sync): advance state to {new_last_sha[:12]}\n\n"
-                f"Source-Repo: {source.url}\n"
-                f"Source-Branch: {source.branch}\n"
-                f"Source-Commit: {new_last_sha}\n"
-                f"Signed-off-by: {SYNC_BOT_NAME} <{SYNC_BOT_EMAIL}>\n"
+        #
+        # Only persisted in push-mode: in pr-mode the hub repo owns the
+        # canonical sync state and this run is proposing a one-off PR into
+        # another repo that must NOT carry the hub's state.json.
+        if mode == MODE_PUSH:
+            state["sources"].setdefault(source.state_key, {}).update(
+                {
+                    "last_sha": new_last_sha,
+                    "url": source.url,
+                    "branch": source.branch,
+                    "src_path": source.src_path,
+                    "dest_path": source.dest_path,
+                }
             )
-            run(
-                ["git", "commit", "-m", msg],
-                cwd=dest_repo,
-                env={
-                    "GIT_COMMITTER_NAME": SYNC_BOT_NAME,
-                    "GIT_COMMITTER_EMAIL": SYNC_BOT_EMAIL,
-                    "GIT_AUTHOR_NAME": SYNC_BOT_NAME,
-                    "GIT_AUTHOR_EMAIL": SYNC_BOT_EMAIL,
-                },
-            )
+            save_state(state)
+            # Commit the state bump (on top of the imported commits, or as its
+            # own commit if nothing was imported). Use a simple identity-signed
+            # sync commit.
+            run(["git", "add", str(STATE_FILE.relative_to(REPO_ROOT))], cwd=dest_repo)
+            if run_ok(["git", "diff", "--cached", "--quiet"], cwd=dest_repo):
+                # no state change (first-run identical) -- nothing to commit
+                pass
+            else:
+                msg = (
+                    f"[{source.name}] chore(sync): advance state to {new_last_sha[:12]}\n\n"
+                    f"Source-Repo: {source.url}\n"
+                    f"Source-Branch: {source.branch}\n"
+                    f"Source-Commit: {new_last_sha}\n"
+                    f"Signed-off-by: {SYNC_BOT_NAME} <{SYNC_BOT_EMAIL}>\n"
+                )
+                run(
+                    ["git", "commit", "-m", msg],
+                    cwd=dest_repo,
+                    env={
+                        "GIT_COMMITTER_NAME": SYNC_BOT_NAME,
+                        "GIT_COMMITTER_EMAIL": SYNC_BOT_EMAIL,
+                        "GIT_AUTHOR_NAME": SYNC_BOT_NAME,
+                        "GIT_AUTHOR_EMAIL": SYNC_BOT_EMAIL,
+                    },
+                )
 
         result.status = "synced" if imported > 0 else "up-to-date"
         result.commits_imported = imported
@@ -788,8 +850,24 @@ def sync_one(source: Source, state: dict, dest_repo: Path, dry_run: bool) -> Sou
         result.status = "failed"
         result.message = str(e)
         result.errors.append(str(e))
+        # On failure in pr-mode, the per-source branch now points at the
+        # unchanged base (pre_head) so there's nothing to propose; clear
+        # dest_branch so the workflow doesn't try to open an empty PR.
+        result.dest_branch = ""
         log(f"{source.name}: FAILED -> {e}")
         return result
+    finally:
+        # In pr-mode, always return dest_repo to the branch we were on
+        # before this source ran, so the NEXT source forks its own
+        # `skills-sync/<name>` branch off the same clean base (the
+        # workflow-checked-out branch). The per-source branches we created
+        # remain intact; the workflow reads result.dest_branch to push them.
+        if mode == MODE_PR and original_branch:
+            run(
+                ["git", "checkout", original_branch],
+                cwd=dest_repo,
+                check=False,
+            )
 
 
 # ---------- github failure reporter ----------
@@ -1363,6 +1441,28 @@ def main() -> int:
     )
     ap.add_argument("--only", type=str, default=None, help="sync only this source name")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--mode",
+        choices=list(ALL_MODES),
+        default=MODE_PUSH,
+        help=(
+            "push (default): commit imports on the current branch and "
+            "update state.json. pr: isolate each source on a "
+            "`skills-sync/<name>` branch, skip state.json writes, and "
+            "let the workflow open/update a PR per source."
+        ),
+    )
+    ap.add_argument(
+        "--results-json",
+        type=Path,
+        default=None,
+        help=(
+            "If set, write a structured JSON summary of per-source results "
+            "to this path. Workflow (mode=pr) reads this to iterate sources "
+            "and open/update a PR per skills-sync/<name> branch. Fields: "
+            "name, status, commits_imported, new_head, dest_branch, message."
+        ),
+    )
     args = ap.parse_args()
 
     sources_dir: Path = args.sources_dir
@@ -1389,10 +1489,11 @@ def main() -> int:
     results: list[SourceResult] = []
     for s in sources:
         log(f"--- syncing: {s.name} ({s.src_path} -> {s.dest_path}) ---")
-        results.append(sync_one(s, state, REPO_ROOT, args.dry_run))
+        results.append(sync_one(s, state, REPO_ROOT, args.dry_run, mode=args.mode))
 
     # Persist state one more time at the end (covers the no-op branches).
-    if not args.dry_run:
+    # Only relevant in push-mode; pr-mode never writes state.json.
+    if not args.dry_run and args.mode == MODE_PUSH:
         save_state(state)
 
     # Summary
@@ -1400,15 +1501,42 @@ def main() -> int:
     log("=== SUMMARY ===")
     exit_code = 0
     for r in results:
-        line = f"  {r.source.name:40s}  {r.status:12s}  {r.message}"
+        branch_suffix = f"  [branch={r.dest_branch}]" if r.dest_branch else ""
+        line = f"  {r.source.name:40s}  {r.status:12s}  {r.message}{branch_suffix}"
         log(line)
         if r.status == "failed":
             exit_code = 1
 
+    # Structured results dump for downstream workflow steps (pr-mode uses
+    # this to iterate sources and open/update one PR per synced branch).
+    # Written unconditionally when --results-json is set so dry-run and
+    # push-mode consumers can also introspect outcomes.
+    if args.results_json is not None:
+        payload = [
+            {
+                "name": r.source.name,
+                "status": r.status,
+                "commits_imported": r.commits_imported,
+                "new_head": r.new_head,
+                "dest_branch": r.dest_branch,
+                "message": r.message,
+                "src_path": r.source.src_path,
+                "dest_path": r.source.dest_path,
+                "url": r.source.url,
+            }
+            for r in results
+        ]
+        args.results_json.parent.mkdir(parents=True, exist_ok=True)
+        args.results_json.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        log(f"wrote {len(payload)} result(s) to {args.results_json}")
+
     # Open/update/close GitHub issues based on results. Best-effort:
     # never affects exit code, silently skips in non-GitHub contexts.
     # Disabled under --dry-run so local rehearsals don't touch the tracker.
-    if not args.dry_run:
+    # Also disabled in pr-mode: the proposing repo shouldn't spam the target
+    # repo's issue tracker with sync-failure issues — the workflow surfaces
+    # failures via job status instead.
+    if not args.dry_run and args.mode == MODE_PUSH:
         # Signal to the reporter that this run processed every configured
         # source, so it's safe to close issues for sources no longer in
         # the config. Under --only we processed a subset, so skip that sweep.

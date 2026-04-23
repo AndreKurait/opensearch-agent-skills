@@ -14,9 +14,9 @@ name: Sync Skills
 
 on:
   schedule:
-    # Every hour at minute 0. Note: GitHub often delays scheduled workflows
-    # under load; treat this as "at least every ~2 hours".
-    - cron: '0 * * * *'
+    # Every 20 minutes. Note: GitHub often delays scheduled workflows
+    # under load; treat this as "at least every ~hour" in practice.
+    - cron: '*/20 * * * *'
   workflow_dispatch:
     inputs:
       only:
@@ -28,6 +28,19 @@ on:
         required: false
         type: boolean
         default: false
+      mode:
+        description: >-
+          Sync mode. push = land imports directly on the target branch (hub
+          mirror behaviour, used by cron). pr = isolate each source on a
+          `skills-sync/<name>` branch, force-push it, and open/update a PR
+          from that branch into the target branch (one PR per source, one
+          failing source doesn't block others).
+        required: false
+        type: choice
+        default: push
+        options:
+          - push
+          - pr
   # Auto-fire on PRs that add/edit a source YAML or touch the sync
   # engine. This lets a contributor just commit
   # `sync/sources/<name>.yaml` and have the mirrored content appear on
@@ -106,10 +119,15 @@ jobs:
 
       - name: Resolve target branch
         id: target
+        env:
+          # Pass untrusted refs through env to avoid script injection
+          # via crafted branch names.
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "branch=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            echo "branch=${PR_HEAD_REF}" >> "$GITHUB_OUTPUT"
           else
             echo "branch=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
@@ -121,20 +139,34 @@ jobs:
           SYNC_BOT_EMAIL: '83309141+opensearch-ci-bot@users.noreply.github.com'
           # `gh` CLI authentication for the in-script issue reporter.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pass inputs through env to avoid direct interpolation into
+          # bash scripts (GitHub security best practice).
+          ONLY_INPUT: ${{ inputs.only }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          # inputs.mode is only set for workflow_dispatch; default to
+          # push for cron and pull_request triggers.
+          MODE_INPUT: ${{ inputs.mode || 'push' }}
         run: |
           set -euo pipefail
           ARGS=()
-          if [[ -n "${{ inputs.only }}" ]]; then
-            ARGS+=(--only "${{ inputs.only }}")
+          if [[ -n "${ONLY_INPUT}" ]]; then
+            ARGS+=(--only "${ONLY_INPUT}")
           fi
-          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+          if [[ "${DRY_RUN_INPUT}" == "true" ]]; then
             ARGS+=(--dry-run)
           fi
+          ARGS+=(--mode "${MODE_INPUT}")
+          # Always write results.json — push-mode ignores it, pr-mode
+          # iterates it in the next step.
+          ARGS+=(--results-json sync-results.json)
           uv run --project sync-bot opensearch-skills-sync "${ARGS[@]}"
+          echo "mode=${MODE_INPUT}" >> "$GITHUB_OUTPUT"
 
       - name: Push
         id: push
-        if: ${{ inputs.dry_run != 'true' }}
+        # Skip in pr-mode: pr-mode force-pushes per-source branches in a
+        # later step and must not touch the target branch directly.
+        if: ${{ inputs.dry_run != 'true' && steps.sync.outputs.mode != 'pr' }}
         run: |
           set -euo pipefail
           BRANCH='${{ steps.target.outputs.branch }}'
@@ -150,13 +182,102 @@ jobs:
           echo "pushed=true" >> "$GITHUB_OUTPUT"
           echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # pr-mode: for every source that imported >=1 commit, force-push its
+      # `skills-sync/<name>` branch and open (or update) a PR from it
+      # into the target branch. One failing source doesn't block the
+      # others — we iterate with || true on per-source errors and keep
+      # track of failures to surface at the end.
+      - name: Open/update PRs (pr-mode)
+        id: prmode
+        if: ${{ inputs.dry_run != 'true' && steps.sync.outputs.mode == 'pr' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE='${{ steps.target.outputs.branch }}'
+          if [[ ! -f sync-results.json ]]; then
+            echo "sync-results.json not produced; nothing to do."
+            exit 0
+          fi
+          # jq filter: only sources that actually synced and have a branch.
+          mapfile -t SYNCED < <(
+            jq -r '.[] | select(.status == "synced" and .dest_branch != "") | .name' sync-results.json
+          )
+          if [[ ${#SYNCED[@]} -eq 0 ]]; then
+            echo "No synced sources in pr-mode; nothing to push."
+            exit 0
+          fi
+          FAIL=0
+          for NAME in "${SYNCED[@]}"; do
+            BRANCH="skills-sync/${NAME}"
+            URL=$(jq -r --arg n "$NAME" '.[] | select(.name == $n) | .url' sync-results.json)
+            SRCPATH=$(jq -r --arg n "$NAME" '.[] | select(.name == $n) | .src_path' sync-results.json)
+            DESTPATH=$(jq -r --arg n "$NAME" '.[] | select(.name == $n) | .dest_path' sync-results.json)
+            COMMITS=$(jq -r --arg n "$NAME" '.[] | select(.name == $n) | .commits_imported' sync-results.json)
+            echo "::group::pr-mode: ${NAME} (${COMMITS} commits) -> ${BRANCH}"
+            # Force-push the per-source branch. --force-with-lease would
+            # be safer, but the branch is bot-owned and reset to HEAD
+            # every run, so a plain --force is intentional: it discards
+            # any stale state from a previous (possibly partial) attempt.
+            if ! git push --force origin "${BRANCH}:${BRANCH}"; then
+              echo "::error::failed to push ${BRANCH}"
+              FAIL=1
+              echo "::endgroup::"
+              continue
+            fi
+            # Open-or-update the PR. `gh pr create` errors if a PR
+            # already exists for the branch; in that case we just edit
+            # the existing one so the body stays in sync.
+            TITLE="[sync] ${NAME}: import ${COMMITS} commit(s) from upstream"
+            BODY=$(cat <<EOF
+          Automated by the skills-sync framework (pr-mode).
+
+          Source repository: ${URL}
+          Source path: \`${SRCPATH}\`
+          Destination path: \`${DESTPATH}\`
+          Commits imported: ${COMMITS}
+
+          This PR was opened from branch \`${BRANCH}\`, which is reset to
+          \`${BASE}\` at the start of every run and then has the upstream
+          commits replayed on top of it. Any manual commits on this
+          branch will be overwritten on the next sync run — edit the
+          upstream skill instead, or convert this sync to push-mode.
+
+          Author attribution is preserved via \`Co-authored-by\` trailers
+          and \`Source-Repo\` / \`Source-Commit\` provenance trailers on
+          each imported commit.
+          EOF
+          )
+            if gh pr view "${BRANCH}" --json number --jq .number >/dev/null 2>&1; then
+              echo "PR already open; updating title/body."
+              gh pr edit "${BRANCH}" --title "${TITLE}" --body "${BODY}" || {
+                echo "::error::failed to edit PR for ${BRANCH}"
+                FAIL=1
+              }
+            else
+              gh pr create \
+                --base "${BASE}" \
+                --head "${BRANCH}" \
+                --title "${TITLE}" \
+                --body "${BODY}" || {
+                  echo "::error::failed to create PR for ${BRANCH}"
+                  FAIL=1
+                }
+            fi
+            echo "::endgroup::"
+          done
+          if [[ "${FAIL}" -ne 0 ]]; then
+            echo "::error::one or more pr-mode sources failed to publish; see logs above"
+            exit 1
+          fi
+
       # After we push bot commits to a PR branch, GitHub's infinite-loop
       # guard suppresses the normal pull_request re-run of CI and
       # validate-skills (because the push was authenticated with
       # GITHUB_TOKEN). Re-dispatch them explicitly so PR checks reflect
       # the post-sync tree.
       - name: Re-trigger PR checks on post-sync HEAD
-        if: ${{ github.event_name == 'pull_request' && steps.push.outputs.pushed == 'true' }}
+        if: ${{ github.event_name == 'pull_request' && steps.push.outputs.pushed == 'true' && steps.sync.outputs.mode != 'pr' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

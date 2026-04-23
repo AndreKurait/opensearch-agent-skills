@@ -125,3 +125,45 @@ To force a full re-import of an upstream, delete its entry from
 `state.json.sources` and commit. The next run will treat it as a
 first-time sync and replay the upstream history (bounded by the
 blob-filtered clone).
+
+## pr-mode (per-source PRs)
+
+The default sync flow above is **push mode** — the bot lands commits
+directly on the target branch, one shared state file, one combined
+history. That's the right choice for the hub repo itself (mirror
+behaviour, immediate availability to agents).
+
+The workflow also supports **pr mode** (`workflow_dispatch` → `mode:
+pr`), which is what the sync-bot framework ships as its externally-
+facing product: for every source with new upstream commits, the bot
+force-pushes a `skills-sync/<source>` branch and opens (or updates) a
+PR from it into the target branch. Each source gets its own PR so
+reviewers see a focused diff and one failing source doesn't block the
+others.
+
+Invariants:
+
+- **No `state.json` writes.** pr-mode derives the last-synced SHA from
+  the `Source-Commit:` trailer on the tip of `skills-sync/<source>`,
+  falling back to the same trailer on the target branch, falling back
+  to "first run". The state is the git history itself, not a file.
+- **Branch reset on every run.** `skills-sync/<source>` is reset to
+  the target branch at the start of each run and then has the
+  upstream commits replayed on top. Manual commits on it are
+  discarded — see `SYNCED_SKILL_POLICY.md` for the "edit upstream
+  instead" flow.
+- **One PR per source.** Even if N upstreams moved in one run, the
+  workflow opens/updates N PRs. A failed source only fails its own
+  PR; the others still publish.
+
+To flip the hub itself to pr-mode, just invoke the workflow with
+`mode: pr`. To invoke it from an automation, `gh workflow run
+sync-skills.yml -f mode=pr`.
+
+## Editing a synced skill
+
+**Don't edit synced files in this repo** — fix the upstream instead,
+and the next sync tick will carry the fix here. See
+[`SYNCED_SKILL_POLICY.md`](./SYNCED_SKILL_POLICY.md) for the full
+rationale and the "break the sync" escape hatch for legitimate
+divergence cases.
