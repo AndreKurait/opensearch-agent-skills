@@ -14,6 +14,7 @@ Skills are organized in a tree — install the whole collection or pick individu
 | **Observability** | [log-analytics](skills/opensearch-skills/observability/log-analytics/) | Query and analyze logs with PPL — error patterns, anomaly detection |
 | **Observability** | [trace-analytics](skills/opensearch-skills/observability/trace-analytics/) | Investigate distributed traces — slow spans, service maps, agent invocations |
 | **Cloud** | [aws-setup](skills/opensearch-skills/cloud/aws-setup/) | Deploy to Amazon OpenSearch Service or Serverless |
+| **Migration** | [solr-opensearch-migration-advisor](skills/solr-opensearch-migration-advisor/) | Migration companion for Apache Solr → OpenSearch — translate schemas, Standard/DisMax/eDisMax queries, and plan cluster sizing. Mirrored from [opensearch-migrations](https://github.com/opensearch-project/opensearch-migrations/tree/main/AIAdvisor/skills/solr-opensearch-migration-advisor) |
 
 > More skills coming soon — contributions welcome! See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md).
 
@@ -32,6 +33,7 @@ npx skills add opensearch-project/opensearch-agent-skills@opensearch-launchpad -
 npx skills add opensearch-project/opensearch-agent-skills@log-analytics --full-depth
 npx skills add opensearch-project/opensearch-agent-skills@trace-analytics --full-depth
 npx skills add opensearch-project/opensearch-agent-skills@aws-setup --full-depth
+npx skills add opensearch-project/opensearch-agent-skills@solr-opensearch-migration-advisor --full-depth
 ```
 
 ### Install options

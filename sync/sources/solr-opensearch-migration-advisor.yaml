@@ -1,0 +1,10 @@
+# Sync source: solr-opensearch-migration-advisor
+#
+# Mirrors the Solr -> OpenSearch migration advisor skill from
+# opensearch-project/opensearch-migrations (AIAdvisor/skills/).
+name: solr-opensearch-migration-advisor
+url: https://github.com/opensearch-project/opensearch-migrations.git
+branch: main
+src_path: AIAdvisor/skills/solr-opensearch-migration-advisor
+# dest_path's leaf must match the upstream SKILL.md `name:` field.
+dest_path: skills/solr-opensearch-migration-advisor
