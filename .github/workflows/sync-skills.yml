@@ -246,6 +246,13 @@ jobs:
           Author attribution is preserved via \`Co-authored-by\` trailers
           and \`Source-Repo\` / \`Source-Commit\` provenance trailers on
           each imported commit.
+
+          ---
+
+          **Reviewing or editing a synced skill?** Read
+          [\`sync/SYNCED_SKILL_POLICY.md\`](../blob/${BASE}/sync/SYNCED_SKILL_POLICY.md)
+          first. TL;DR: fixes belong **upstream**, not on this PR branch —
+          any commit pushed here is overwritten on the next sync run.
           EOF
           )
             if gh pr view "${BRANCH}" --json number --jq .number >/dev/null 2>&1; then
