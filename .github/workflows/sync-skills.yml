@@ -215,6 +215,30 @@ jobs:
             DESTPATH=$(jq -r --arg n "$NAME" '.[] | select(.name == $n) | .dest_path' sync-results.json)
             COMMITS=$(jq -r --arg n "$NAME" '.[] | select(.name == $n) | .commits_imported' sync-results.json)
             echo "::group::pr-mode: ${NAME} (${COMMITS} commits) -> ${BRANCH}"
+            # Idempotency guard: if the remote branch already exists and its
+            # tip tree matches the locally-rebuilt tree, nothing content-wise
+            # has changed. Skip the force-push (and skip PR body update) so
+            # repeated cron runs with no upstream changes don't churn the
+            # branch SHA, retrigger CI, or spam subscribers on open PRs.
+            #
+            # We compare *tree* SHAs, not commit SHAs: the squashed commit is
+            # rebuilt every run with a fresh committer timestamp, so its SHA
+            # always differs even when content is byte-identical. The tree
+            # SHA is a pure content hash and is stable across rebuilds.
+            LOCAL_TREE=$(git rev-parse "${BRANCH}^{tree}")
+            # Fetch the remote tip (if any) and read *its* tree SHA. We
+            # can't use `git ls-remote` here because that returns the
+            # commit SHA, not the tree SHA. `|| true` swallows the error
+            # when the branch doesn't exist remotely yet (first run).
+            REMOTE_TREE=""
+            if git fetch origin "${BRANCH}" --depth=1 2>/dev/null; then
+              REMOTE_TREE=$(git rev-parse "FETCH_HEAD^{tree}" 2>/dev/null || echo "")
+            fi
+            if [[ -n "${REMOTE_TREE}" && "${LOCAL_TREE}" == "${REMOTE_TREE}" ]]; then
+              echo "Remote ${BRANCH} tree matches local tree (${LOCAL_TREE:0:12}); skipping push + PR update."
+              echo "::endgroup::"
+              continue
+            fi
             # Force-push the per-source branch. --force-with-lease would
             # be safer, but the branch is bot-owned and reset to HEAD
             # every run, so a plain --force is intentional: it discards

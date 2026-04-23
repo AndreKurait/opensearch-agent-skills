@@ -160,6 +160,16 @@ To flip the hub itself to pr-mode, just invoke the workflow with
 `mode: pr`. To invoke it from an automation, `gh workflow run
 sync-skills.yml -f mode=pr`.
 
+### Repo-level prereq for pr-mode
+
+pr-mode uses `GITHUB_TOKEN` to open PRs, which requires the repo to
+allow Actions to create pull requests. Enable it once at **Settings →
+Actions → General → Workflow permissions → "Allow GitHub Actions to
+create and approve pull requests"**. A user/org-level toggle with the
+same name does **not** override a repo-level OFF — GitHub evaluates
+the most restrictive. Symptom if missing: `gh pr create` fails with
+`GitHub Actions is not permitted to create or approve pull requests`.
+
 ## Editing a synced skill
 
 **Don't edit synced files in this repo** — fix the upstream instead,
