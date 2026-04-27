@@ -77,18 +77,25 @@ runs:
 
         # --- 2. Query target branch protection -------------------------
         # /repos/{owner}/{repo}/branches/{branch} returns `.protected`
-        # (bool) without needing admin:repo scope. If we can't read it
-        # (rate-limited, branch doesn't exist, token too narrow) we
-        # treat as "unknown" and do NOT fail strict mode on ambiguity —
-        # the push itself will still fail loudly if actually blocked.
+        # (bool) with just `contents: read`. Surface any API error so a
+        # future "preflight silently passed" bug is obvious instead of
+        # hidden by a redirect to /dev/null.
         PROTECTED="unknown"
-        BRANCH_JSON="$(gh api "repos/${REPO}/branches/${TARGET}" 2>/dev/null || true)"
-        if [[ -n "${BRANCH_JSON}" ]]; then
+        BRANCH_STDERR="$(mktemp)"
+        if BRANCH_JSON="$(gh api "repos/${REPO}/branches/${TARGET}" 2>"${BRANCH_STDERR}")"; then
           BRANCH_PROTECTED="$(echo "${BRANCH_JSON}" | jq -r '.protected // "unknown"')"
           if [[ "${BRANCH_PROTECTED}" == "true" || "${BRANCH_PROTECTED}" == "false" ]]; then
             PROTECTED="${BRANCH_PROTECTED}"
           fi
+        else
+          # gh api exited non-zero. Show why so operators can fix the
+          # token scope (or whatever is blocking the read). We still
+          # continue — the push step itself will fail loudly on a real
+          # block, so "preflight couldn't read protection" is advisory.
+          echo "::warning::sync-preflight: could not read repos/${REPO}/branches/${TARGET}:"
+          sed 's/^/::warning::sync-preflight:   /' "${BRANCH_STDERR}"
         fi
+        rm -f "${BRANCH_STDERR}"
         echo "protected=${PROTECTED}" >> "${GITHUB_OUTPUT}"
         echo "sync-preflight: target '${TARGET}' protected=${PROTECTED}"
 
