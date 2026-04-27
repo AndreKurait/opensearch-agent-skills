@@ -50,7 +50,12 @@ cron:
   # Upstream opensearch-project/opensearch-agent-skills leaves main
   # unprotected and uses push-mode; any PR back to upstream should
   # flip this value before merging.
-  mode: pr
+  #
+  # INTENTIONAL REGRESSION: this branch exists to demonstrate that the
+  # preflight catches push-mode against a protected default branch.
+  # `validate-skills.yml` should fail at the "Preflight cron mode
+  # against default branch" step when this PR is opened.
+  mode: push
 
   # If true, the preflight hard-fails on incompatibility. If false, it
   # emits a ::warning:: and lets the sync run anyway (the push step
