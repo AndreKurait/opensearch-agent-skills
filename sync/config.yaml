@@ -1,0 +1,68 @@
+# Skill-sync framework configuration.
+#
+# This is the single source of truth for how the sync workflows behave
+# on this repository. Both .github/workflows/sync-skills.yml (cron) and
+# .github/workflows/validate-skills.yml (PR dry-run) read this file at
+# the start of every job and resolve their behaviour from it.
+#
+# Why a file (vs. repo variables or workflow defaults):
+#
+#   * Changes are reviewed in a PR, diffable in git history, and travel
+#     with the branch — forks start from a known-good config instead of
+#     having to remember which dashboard toggles to flip.
+#   * A single file means there's exactly one place to look when
+#     debugging "why did the cron push / not push?".
+#
+# What is NOT here (by design):
+#
+#   * cron schedule — GitHub resolves `on.schedule:` at the workflow-file
+#     level, not at runtime, so it has to stay in the workflow yaml.
+#   * target branch — cron always targets the default branch; PR runs
+#     target the PR head. Both are event-derived and need no config.
+#   * Per-source settings — those live in sync/sources/<name>.yaml.
+#
+# Override precedence (most specific wins):
+#
+#   1. workflow_dispatch `mode` input (one-off manual override; no commit
+#      needed — useful for emergency "switch to pr-mode now" on a repo
+#      whose main just became protected).
+#   2. This file.
+#
+# --------------------------------------------------------------------
+
+cron:
+  # How the scheduled sync lands imported commits on the target branch.
+  #
+  #   push — Fast-forward push directly onto the target branch. Works
+  #          on repos where the bot can push to the default branch
+  #          (i.e. unprotected, OR with a ruleset bypass for the bot).
+  #
+  #   pr   — Force-push each source onto a dedicated `skills-sync/<name>`
+  #          branch and open/update one PR per source against the
+  #          target branch. Required on repos with protected default
+  #          branches. One failing source does not block the others.
+  #
+  # The preflight (.github/actions/sync-preflight) fails fast if this
+  # value is incompatible with the target branch's protection state
+  # (e.g. push-mode against a protected main).
+  #
+  # This fork runs with `main` protected, so pr-mode is required.
+  # Upstream opensearch-project/opensearch-agent-skills leaves main
+  # unprotected and uses push-mode; any PR back to upstream should
+  # flip this value before merging.
+  mode: pr
+
+  # If true, the preflight hard-fails on incompatibility. If false, it
+  # emits a ::warning:: and lets the sync run anyway (the push step
+  # itself will still surface a real block). Leave true unless you have
+  # a specific reason to let the cron attempt a push that's known to be
+  # blocked.
+  strict_preflight: true
+
+bot:
+  # Identity used for git committer + Signed-off-by on imported commits.
+  # Default is the opensearch-project CI bot so pushes survive the
+  # "committer verified" branch rule. Forks that want their own bot
+  # identity can edit these values.
+  name: opensearch-ci
+  email: '83309141+opensearch-ci-bot@users.noreply.github.com'
