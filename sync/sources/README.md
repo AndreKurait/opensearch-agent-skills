@@ -59,5 +59,18 @@ a tracking issue labelled `sync-failure` + `sync-source:<name>` with
 the error. Fix the YAML, push again, and the issue auto-closes on the
 next successful sync.
 
+If the auto-sync is **skipped** on your PR (head appears on a fork:
+`head.repo != base.repo`), that's by design — GitHub issues only
+read-only `GITHUB_TOKEN`s for `pull_request` events from forks, so
+the workflow can't push the replayed commits back onto your branch.
+To preview the replay locally, dispatch `Sync Skills` on your own
+fork against the PR branch — the fork-context run has write access
+and pushes onto the PR head (which auto-updates the upstream PR):
+
+    gh workflow run sync-skills.yml \
+      --repo <you>/opensearch-agent-skills \
+      --ref <your-pr-branch> \
+      -f only=<this-source-name>
+
 For full details on the sync engine and commit-rewriting semantics see
 [../README.md](../README.md).

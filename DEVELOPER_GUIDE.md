@@ -195,7 +195,16 @@ The entire flow is: drop one YAML file, open a PR.
 
 3. `Sync Skills` auto-fires on PRs that touch `sync/sources/**`. It replays the upstream history into `dest_path`, pushes those commits onto your PR branch, and re-runs CI + dry-run spec validation against the post-sync HEAD. Review the replayed commits, then merge.
 
-PRs opened from forks skip the auto-push (GitHub denies write tokens to forks) but still run dry-run validation, so config mistakes surface before merge.
+PRs opened from forks skip the auto-push (GitHub denies write tokens to forks) but still run dry-run validation, so config mistakes surface before merge. The fork owner can still preview the replayed commits before merge by dispatching `Sync Skills` on their own fork against the PR branch — that run executes under the fork's write-scoped token and pushes the imports onto the PR branch:
+
+```bash
+gh workflow run sync-skills.yml \
+  --repo <you>/opensearch-agent-skills \
+  --ref <your-pr-branch> \
+  -f only=<new-source-name>
+```
+
+Note: enabling "Allow edits and access to secrets by maintainers" on the PR does **not** unblock this — that toggle applies to human pushes; `pull_request`-event workflow tokens from forks are read-only regardless.
 
 ### Running the sync locally
 

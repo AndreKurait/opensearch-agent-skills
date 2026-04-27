@@ -89,6 +89,33 @@ PRs opened from forks skip the auto-push (GitHub won't let workflows
 write to forks) but still run dry-run validation, so config mistakes
 surface before merge.
 
+### Previewing the replayed commits on a fork PR
+
+Fork PRs don't get the auto-push because GitHub only issues read-only
+`GITHUB_TOKEN`s for `pull_request` events from forks — the "Allow
+edits and access to secrets by maintainers" checkbox on the PR does
+**not** change that (it applies to human pushes only). The platform
+enforces this at the token level to prevent a malicious PR from
+rewriting the workflow and exfiltrating secrets.
+
+Escape hatch: the fork owner can dispatch `Sync Skills` on their own
+fork against the PR branch. That run executes under the fork's context
+where `GITHUB_TOKEN` has write access, and any replayed commits land
+on the PR branch (which auto-updates the upstream PR since the branch
+is the PR head).
+
+```bash
+# Dispatch on your fork, scoped to the new source, against the PR branch.
+gh workflow run sync-skills.yml \
+  --repo <you>/opensearch-agent-skills \
+  --ref <your-pr-branch> \
+  -f only=<new-source-name>
+```
+
+Reviewers then see the real imported tree on the PR before merging.
+This is a fork-owner-only action — nothing an upstream reviewer can
+trigger from their side.
+
 ## Running locally
 
 ```bash
