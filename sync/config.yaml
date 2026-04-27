@@ -45,7 +45,12 @@ cron:
   # The preflight (.github/actions/sync-preflight) fails fast if this
   # value is incompatible with the target branch's protection state
   # (e.g. push-mode against a protected main).
-  mode: push
+  #
+  # This fork runs with `main` protected, so pr-mode is required.
+  # Upstream opensearch-project/opensearch-agent-skills leaves main
+  # unprotected and uses push-mode; any PR back to upstream should
+  # flip this value before merging.
+  mode: pr
 
   # If true, the preflight hard-fails on incompatibility. If false, it
   # emits a ::warning:: and lets the sync run anyway (the push step
