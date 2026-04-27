@@ -77,6 +77,31 @@ run_case() {
 }
 
 FAIL=0
+
+# --- Unit regression for the jq-false-is-falsy bug ---
+# Make sure the action distinguishes `.protected: false` (unprotected,
+# API responded) from missing/error (truly unknown). The earlier
+# `.protected // "unknown"` form collapsed both to "unknown", which
+# silently turned the preflight into a placebo on unprotected repos.
+JQ_EXPR='if has("protected") then .protected else "unknown" end'
+EXPECT_PAIRS=(
+  '{"protected":false}|false'
+  '{"protected":true}|true'
+  '{}|unknown'
+  '{"name":"main"}|unknown'
+)
+for pair in "${EXPECT_PAIRS[@]}"; do
+  JSON="${pair%%|*}"
+  WANT="${pair##*|}"
+  GOT="$(echo "${JSON}" | jq -r "${JQ_EXPR}")"
+  if [[ "${GOT}" == "${WANT}" ]]; then
+    echo "PASS  jq-regression  ${JSON} -> ${GOT}"
+  else
+    echo "FAIL  jq-regression  ${JSON} -> ${GOT} (want ${WANT})"
+    FAIL=1
+  fi
+done
+
 run_case "push -> unprotected fork main (expect OK)" \
   push main AndreKurait/opensearch-agent-skills true 0 || FAIL=1
 

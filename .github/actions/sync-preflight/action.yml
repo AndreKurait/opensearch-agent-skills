@@ -80,10 +80,15 @@ runs:
         # (bool) with just `contents: read`. Surface any API error so a
         # future "preflight silently passed" bug is obvious instead of
         # hidden by a redirect to /dev/null.
+        #
+        # jq caveat: `.protected // "unknown"` wrongly substitutes when
+        # .protected is present but `false`, because jq's // treats
+        # `false` as a "null-ish" fallback trigger. Use `if has(...)`
+        # to distinguish "missing" from "explicitly false".
         PROTECTED="unknown"
         BRANCH_STDERR="$(mktemp)"
         if BRANCH_JSON="$(gh api "repos/${REPO}/branches/${TARGET}" 2>"${BRANCH_STDERR}")"; then
-          BRANCH_PROTECTED="$(echo "${BRANCH_JSON}" | jq -r '.protected // "unknown"')"
+          BRANCH_PROTECTED="$(echo "${BRANCH_JSON}" | jq -r 'if has("protected") then .protected else "unknown" end')"
           if [[ "${BRANCH_PROTECTED}" == "true" || "${BRANCH_PROTECTED}" == "false" ]]; then
             PROTECTED="${BRANCH_PROTECTED}"
           fi
