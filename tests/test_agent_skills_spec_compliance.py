@@ -56,9 +56,7 @@ def _collect_skill_mds() -> list[Path]:
 
 # Skills excluded from spec compliance checks.
 # Add a skill's directory name here to skip it temporarily.
-_SKIP_SKILLS: frozenset[str] = frozenset({
-    "solr-opensearch-migration-advisor",
-})
+_SKIP_SKILLS: frozenset[str] = frozenset()
 
 
 def _parse_frontmatter(path: Path) -> tuple[dict, str]:
